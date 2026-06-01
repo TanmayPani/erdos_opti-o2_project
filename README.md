@@ -63,8 +63,7 @@ datasets/BeaverCreekWA_EssDive_26Jun2019-30Sep2024/data/
 ```
 
 a [BagIt](https://en.wikipedia.org/wiki/BagIt)-packaged dataset published on
-[ESS-DIVE](https://ess-dive.lbl.gov/). The `datasets/` folder also contains the
-original `.zip` archives.
+[ESS-DIVE](https://ess-dive.lbl.gov/).
 
 If `datasets/` is missing after cloning (large data files may be distributed
 separately), recreate the path above by unzipping the corresponding archive, or
