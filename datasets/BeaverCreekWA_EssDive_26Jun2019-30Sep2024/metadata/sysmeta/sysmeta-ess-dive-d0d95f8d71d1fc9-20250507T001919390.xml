@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns3:systemMetadata xmlns:ns2="http://ns.dataone.org/service/types/v1" xmlns:ns3="http://ns.dataone.org/service/types/v2.0">
+    <serialVersion>2</serialVersion>
+    <identifier>ess-dive-d0d95f8d71d1fc9-20250507T001919390</identifier>
+    <formatId>text/csv</formatId>
+    <size>1142</size>
+    <checksum algorithm="MD5">f6ee4977c335f0c132bc40bbbdf74748</checksum>
+    <submitter>http://orcid.org/0000-0002-4337-7698</submitter>
+    <rightsHolder>http://orcid.org/0000-0002-4337-7698</rightsHolder>
+    <accessPolicy>
+        <allow>
+            <subject>CN=urn:node:ESS_DIVE,DC=dataone,DC=org</subject>
+            <permission>read</permission>
+            <permission>write</permission>
+            <permission>changePermission</permission>
+        </allow>
+        <allow>
+            <subject>CN=ess-dive-publish,DC=dataone,DC=org</subject>
+            <permission>read</permission>
+        </allow>
+        <allow>
+            <subject>CN=ess-dive-publish,DC=dataone,DC=org</subject>
+            <permission>read</permission>
+        </allow>
+        <allow>
+            <subject>CN=ess-dive-admins,DC=dataone,DC=org</subject>
+            <permission>read</permission>
+            <permission>write</permission>
+            <permission>changePermission</permission>
+        </allow>
+        <allow>
+            <subject>public</subject>
+            <permission>read</permission>
+        </allow>
+    </accessPolicy>
+    <replicationPolicy replicationAllowed="true" numberReplicas="2">
+        <preferredMemberNode>urn:node:KNB</preferredMemberNode>
+        <preferredMemberNode>urn:node:mnORC1</preferredMemberNode>
+        <blockedMemberNode>urn:node:mnUNM1</blockedMemberNode>
+        <blockedMemberNode>urn:node:mnUCSB1</blockedMemberNode>
+        <blockedMemberNode>urn:node:US_MPC</blockedMemberNode>
+        <blockedMemberNode>urn:node:NMEPSCOR</blockedMemberNode>
+        <blockedMemberNode>urn:node:PPBIO</blockedMemberNode>
+    </replicationPolicy>
+    <archived>false</archived>
+    <dateUploaded>2025-05-07T00:19:23.185+00:00</dateUploaded>
+    <dateSysMetadataModified>2025-08-26T00:01:02.465+00:00</dateSysMetadataModified>
+    <originMemberNode>urn:node:ESS_DIVE</originMemberNode>
+    <authoritativeMemberNode>urn:node:ESS_DIVE</authoritativeMemberNode>
+    <replica>
+        <replicaMemberNode>urn:node:ESS_DIVE</replicaMemberNode>
+        <replicationStatus>completed</replicationStatus>
+        <replicaVerified>2025-08-08T06:01:26.884+00:00</replicaVerified>
+    </replica>
+    <fileName>flmd.csv</fileName>
+</ns3:systemMetadata>

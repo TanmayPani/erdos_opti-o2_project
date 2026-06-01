@@ -1,0 +1,3 @@
+Bagging-Date: 2026-05-30
+Payload-Oxum: 61637010.3
+Bag-Size: 58.8 MB
