@@ -39,12 +39,10 @@ their longer-term goal of modeling coastal-ecosystem response to sea-level rise
 ## Data sources
 
 **Primary (real) dataset — Opti O2, under NDA, delivered after signing.**
-A six-year (≈2019–2025), continuous, 5-minute-resolution time series of subsurface
+A six-year ($\approx$ 2019-2025), continuous, 5-minute-resolution time series of subsurface
 DO measured with Opti O2's optical sensor technology, co-located with **three
 water-quality / hydrological variables** and **five meteorological parameters**, plus
-the team's **manual DO-event class labels** (the supervised targets). This dataset is
-confidential and is not yet in hand; the proposal is structured so that all method
-development can proceed before delivery.
+the team's **manual DO-event class labels** (the supervised targets). The actual dataset is not yet in hand.
 
 **Stand-in dataset — public, used for immediate prototyping.**
 The same group's public release on **ESS-DIVE** (DOE's Environmental Systems Science
@@ -53,8 +51,8 @@ data repository) for the *same study site*:
 - *Title:* "Five Years of Dissolved Oxygen, Temperature, Salinity, Depth, Weather
   Data from a Transitioning Wetland at Beaver Creek, Washington, USA"
   (Ghosh, McIntire, Freeman, Ward, Regier, Norwood, Shooltz, Myers-Pigg, et al.).
-- *Site:* PNNL-managed floodplain on Beaver Creek, WA (≈46.9056° N, −123.9806° W).
-- *Coverage explored:* 2019-06-26 → 2024-09-30, **~553,845 rows at 5-minute cadence**.
+- *Site:* PNNL-managed floodplain on Beaver Creek, WA ( $\approx (46.9056\degree N, -123.9806\degree W)$ ).
+- *Coverage explored:* 2019-06-26 &rarr; 2024-09-30, **~553,845 rows at 5-minute cadence**.
 - *Links:*
   - ESS-DIVE landing page: <https://data.ess-dive.lbl.gov/view/ess-dive-9925a1a27161e64>
   - DataONE resolve (package id `ess-dive-9925a1a27161e64`):
@@ -70,9 +68,8 @@ data repository) for the *same study site*:
 [`exploratory.py`](exploratory.py) confirms the dataset has exactly the structure the
 modeling relies on:
 
-- **Episodic, zero-inflated DO.** DO / $O_{2}$% are **$\appprox 92.5$% exact zeros** (the anoxic
-  baseline) with a clearly separated oxic mode — oxygenation is genuinely *event*-like,
-  validating an event-detection-then-classification framing.
+- **Episodic, zero-inflated DO.** DO / $O_{2}$% are **$\approx 92.5$% exact zeros** (the anoxic
+  baseline) with a clearly separated oxic mode (oxygenation is genuinely *event*-like).
 - **Multiple regimes in the drivers.** Well salinity is **multimodal** (peaks near
   ~5–6 and ~10 PPT), consistent with the salinization / step-change narrative behind
   hot moments.
