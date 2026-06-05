@@ -54,10 +54,8 @@ data repository) for the *same study site*:
 - *Site:* PNNL-managed floodplain on Beaver Creek, WA ( $\approx (46.9056\degree N, -123.9806\degree W)$ ).
 - *Coverage explored:* 2019-06-26 &rarr; 2024-09-30, **~553,845 rows at 5-minute cadence**.
 - *Links:*
-  - ESS-DIVE landing page: <https://data.ess-dive.lbl.gov/view/ess-dive-9925a1a27161e64>
-  - DataONE resolve (package id `ess-dive-9925a1a27161e64`):
-    <https://cn.dataone.org/cn/v2/resolve/ess-dive-9925a1a27161e64-20250522T191344828>
-  - Related peer-reviewed article (Limnology & Oceanography): <https://doi.org/10.1002/lno.12426>
+  - [ESS-DIVE landing page]([https://data.ess-dive.lbl.gov/view/ess-dive-9925a1a27161e64](https://data.ess-dive.lbl.gov/view/doi:10.15485/2530966))
+  - [Related peer-reviewed article (Limnology & Oceanography)](https://doi.org/10.1002/lno.12426)
 - *Variables:* dissolved oxygen (mg/L) and $O_{2}$ concentration (%), DO-sensor
   temperature ($\degree C$), well salinity (PPT), floodplain water level (cm below ground
   surface); and weather: solar flux density, precipitation, air temperature,
