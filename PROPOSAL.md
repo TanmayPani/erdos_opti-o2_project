@@ -100,7 +100,7 @@ modeling relies on:
 Because the DO series is dominated by the anoxic baseline, raw accuracy is misleading;
 KPIs emphasize class-balanced metrics and uplift over naive baselines.
 
-1. **Event detection quality.** $\geq 0.9$ ** precision and recall** for detected
+1. **Event detection quality.** $\geq 0.9$ **precision and recall** for detected
    oxygenation events versus an expert-reviewed reference set (event = contiguous
    departure from the anoxic baseline).
 2. **Classification performance.** **Macro-F1** $\geq 0.85$ on held-out events for the
