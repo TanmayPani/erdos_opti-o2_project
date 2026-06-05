@@ -1,5 +1,5 @@
 # Opti O2
-
+[proposal](PROPOSAL.md)
 Exploratory analysis of dissolved-oxygen dynamics in a flood-plain monitoring
 well, using a 5-minute-cadence environmental record from **Beaver Creek, WA**
 (2019-06-26 → 2024-09-30, ~554k rows): dissolved oxygen, salinity, water level,
