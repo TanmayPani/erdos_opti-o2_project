@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.23.8"
-app = marimo.App(width="full", layout_file="layouts/exploratory.slides.json")
+app = marimo.App(width="full")
 
 with app.setup:
     from pathlib import Path
@@ -478,34 +478,26 @@ def _():
     ### How an event is defined, filtered, and counted
 
     **Definition.** The well is anoxic (DO = 0) ~92 % of the time, so we treat any
-    sample with **DO > 0 mg/L** as *oxic* and define a raw event as a **maximal
-    contiguous run of oxic samples** on the regular 5-minute grid.
+    sample with **DO > 0 mg/L** as *oxic* and define a raw event as a **contiguous run of non-zero oxic samples** on the regular 5-minute grid.
 
-    **Gap merging.** Real incursions flicker briefly back to zero (sensor noise, a
-    short ebb). To avoid splitting one physical event into many, `detect_events`
-    **absorbs any baseline gap of <= 12 samples (1 hour)** back into the surrounding
-    event (the `merge_gap` argument). Longer returns to anoxia end the event.
+    **Gap merging.** Occasionally events will flicker briefly back to zero (sensor noise, a
+    short ebb). To avoid splitting one physical events unnecessarily, `detect_events`
+    **combines events with a gap of <= 12 samples (1 hour)**
+    (the `merge_gap` argument).
 
-    **Selection of "proper" events.** A merged candidate is kept only if it has a
+    **Selection of "proper" events.** After merging gaps a candidate is kept only if it has a
     genuine oxic peak and lasts long enough to have a shape worth classifying:
 
     - **peak DO >= 0.5 mg/L** — discards shallow near-zero flicker, and
-    - **duration >= 15 min** (>= 3 samples) — discards single-sample blips.
+    - **duration >= 15 min** (>= 3 samples) — discards short blips.
 
-    **How we reach 73.** The funnel on this stand-in record is:
+    **How we reach 73.** To summarize:
 
-    | stage | count |
+    | step | count |
     |---|---|
-    | raw oxic runs (DO > 0, contiguous) | **157** |
+    | raw events (DO > 0) | **157** |
     | after merging baseline gaps <= 1 h | **119** |
     | after `peak >= 0.5 mg/L` **and** `dur >= 15 min` | **73** |
-
-    The selection step is dominated by the **peak threshold** (it removes 46 of the
-    46 dropped candidates; the duration guard alone removes only 3, all of which also
-    fail the peak test). All three knobs — `merge_gap`, the peak floor, and the
-    minimum duration — are explicit parameters, so the event count is a tunable,
-    auditable choice rather than a black box, and can be re-derived verbatim on the
-    Opti O2 record.
     """)
     return
 
@@ -604,11 +596,8 @@ def _(events):
         _chart,
         mo.md(
             r"""
-    **What we learn:** the distribution is heavily skewed toward **low `peak_frac`** —
-    most events rise abruptly and decay slowly. Symmetry is therefore a strong,
-    *imbalanced* signal: this site is dominated by hot-moment-like events, with only a
-    thin tail of symmetric pulses. That class imbalance is exactly why the proposal's
-    KPIs lean on macro-F1 / Cohen's kappa rather than raw accuracy.
+    **What we learn:** the distribution is heavily skewed toward **fast rise long decay events** —
+    most events rise much faster than they decay. Symmetry is therefore a good signal for classifying events. 
             """
         ),
     ])
@@ -629,11 +618,9 @@ def _(events):
         _chart,
         mo.md(
             r"""
-    **What we learn:** the abrupt (low `peak_frac`) events sit mostly at **positive
-    salinity steps** — consistent with tidal-water incursion driving hot moments — while
-    the more symmetric events gather near a zero/negative salinity step. The separation
-    is real but not crisp, and precipitation (colour) shows no obvious gradient here,
-    foreshadowing the soft cluster boundary in Section 4 and the need for labelled data.
+    **What we learn:** there seems to be a trend toward abrupt (fast rise long decay) 
+    events sitting at **higher salinity** — consistent with tidal-water incursion 
+    driving abrupt events. 
             """
         ),
     ])
@@ -668,11 +655,10 @@ def _(event_samples, events):
         _chart,
         mo.md(
             r"""
-    **What we learn:** the shapes confirm the feature is capturing what we intend. The
-    low-`peak_frac` events spike almost immediately then taper over the rest of the
+    **What we learn:** The
+    asymmetric events spike almost immediately then taper over the rest of the
     window (the classic asymmetric hot-moment signature), whereas the `peak_frac ~ 0.5`
-    events rise and fall roughly evenly. This validates `peak_frac` (and the rise/fall
-    rates) as faithful, interpretable shape descriptors for the classifier.
+    events rise and fall roughly evenly.
             """
         ),
     ])
@@ -684,12 +670,10 @@ def _():
     mo.md(r"""
     ## Section 4 — Unsupervised structure: do the two classes emerge on their own?
 
-    Before training a *supervised* classifier we ask whether the expert taxonomy is
+    Before training a *supervised* classifier we ask whether the taxonomy is
     already latent in the data. We log-scale the skewed magnitude features, standardise
     everything, and run **k-means** on the 73 events. If the hot-moment / oxic-pulse
-    split is real, an unsupervised method given **k = 2** should rediscover it — and the
-    clusters should differ along the *physically meaningful* axes (symmetry, salinity
-    step, duration), not arbitrary ones.
+    split is real, an unsupervised method given **k = 2** should rediscover it.
     """)
     return
 
@@ -753,14 +737,7 @@ def _(events_clustered):
         mo.md(
             r"""
     **What we learn:** with no labels at all, k-means cleanly separates the events into
-    two groups that map onto the expert classes. The *asymmetric (hot-moment-like)*
-    cluster carries low `peak_frac` and large **positive salinity steps** (tidal
-    incursion); the *symmetric (pulse-like)* cluster has near-zero salinity steps and
-    longer, higher-peaked events. The split runs along the physically meaningful axes
-    the domain hypothesis predicts — strong evidence the two-class taxonomy is real and
-    *learnable*, which justifies the supervised approach. The modest silhouette (~0.22)
-    and the slightly higher k = 3 score also warn that the boundary is soft and may hide
-    sub-classes — so expert labels remain essential for the final classifier.
+    two groups that map onto the classes.
             """
         ),
     ])
@@ -787,12 +764,9 @@ def _(events_clustered):
         mo.ui.table(_prof, selection=None),
         mo.md(
             r"""
-    **What we learn:** the cluster medians read like the textbook descriptions. The
-    *hot-moment-like* group is short, abrupt (low `peak_frac`) and rides a clear
-    **positive salinity step** with a large negative water-level step (tidal flooding);
-    the *pulse-like* group is longer, more **symmetric**, with a salinity step near zero.
-    Precipitation barely separates them in this stand-in well, flagging that the
-    *precip → oxic-pulse* link is weak here and will need the real labelled record to
+    **What we learn:** 
+    Precipitation barely separates theclasses, indicating that the
+    *precip → oxic-pulse* link is weak and may need a large data set to
     confirm.
             """
         ),
