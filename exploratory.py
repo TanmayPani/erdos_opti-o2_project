@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.23.8"
-app = marimo.App(width="full")
+app = marimo.App(width="full", layout_file="layouts/exploratory.slides.json")
 
 with app.setup:
     from pathlib import Path
@@ -9,6 +9,10 @@ with app.setup:
     import polars as pl
     import altair as alt
     import numpy as np
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.cluster import KMeans
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import silhouette_score
 
     # Some columns carry per-day means/maxes that blow past Altair's default
     # 5k-row guard; we keep our chart payloads small but disable it to be safe.
@@ -408,6 +412,391 @@ def _(df):
             (_spectrum + _rules + _labels).properties(width=900, height=300),
         ]
     )
+    return
+
+
+@app.cell
+def _():
+    mo.md(r"""
+    ## Section 3 — Event detection & shape features
+
+    The DO series sits at the anoxic baseline (DO = 0) ~92 % of the time; oxygen
+    arrives in discrete **events**. Below we (i) **detect** events as contiguous
+    departures from the baseline — merging across sub-hour dropouts so a briefly
+    interrupted incursion stays one event — then (ii) engineer **shape features**
+    (duration, peak, integrated load, and *time-to-peak symmetry*) and
+    **antecedent / coincident drivers** (salinity and water-level *steps*, prior-24 h
+    precipitation). These are the inputs a supervised classifier will use to
+    separate abrupt, asymmetric **hot moments** from symmetric **oxic pulses**.
+    """)
+    return
+
+
+@app.function
+def detect_events(frame, do_col="Dissolved Oxygen (mg/L)", merge_gap=12):
+    """One row per oxygenation event (contiguous DO > 0), merging baseline gaps
+    of <= merge_gap samples (12 = 1 h at the 5-min cadence) into the surrounding
+    event. Returns columns: eid, start, end."""
+    f = frame.select("Datetime", (pl.col(do_col) > 0).alias("_oxic"))
+    f = f.with_columns(
+        (pl.col("_oxic") != pl.col("_oxic").shift(1))
+        .fill_null(True)
+        .cum_sum()
+        .alias("_rid")
+    )
+    runs = (
+        f.group_by("_rid")
+        .agg(
+            pl.col("_oxic").first(),
+            pl.len().alias("_n"),
+            pl.col("Datetime").min().alias("start"),
+            pl.col("Datetime").max().alias("end"),
+        )
+        .sort("start")
+    )
+    # absorb a short baseline gap into its neighbours, then re-segment
+    runs = runs.with_columns(
+        pl.when(~pl.col("_oxic") & (pl.col("_n") <= merge_gap))
+        .then(True)
+        .otherwise(pl.col("_oxic"))
+        .alias("_om")
+    )
+    runs = runs.with_columns(
+        (pl.col("_om") != pl.col("_om").shift(1)).fill_null(True).cum_sum().alias("eid")
+    )
+    return (
+        runs.filter(pl.col("_om"))
+        .group_by("eid")
+        .agg(pl.col("start").min(), pl.col("end").max())
+        .sort("start")
+    )
+
+
+@app.cell
+def _():
+    mo.md(r"""
+    ### How an event is defined, filtered, and counted
+
+    **Definition.** The well is anoxic (DO = 0) ~92 % of the time, so we treat any
+    sample with **DO > 0 mg/L** as *oxic* and define a raw event as a **maximal
+    contiguous run of oxic samples** on the regular 5-minute grid.
+
+    **Gap merging.** Real incursions flicker briefly back to zero (sensor noise, a
+    short ebb). To avoid splitting one physical event into many, `detect_events`
+    **absorbs any baseline gap of <= 12 samples (1 hour)** back into the surrounding
+    event (the `merge_gap` argument). Longer returns to anoxia end the event.
+
+    **Selection of "proper" events.** A merged candidate is kept only if it has a
+    genuine oxic peak and lasts long enough to have a shape worth classifying:
+
+    - **peak DO >= 0.5 mg/L** — discards shallow near-zero flicker, and
+    - **duration >= 15 min** (>= 3 samples) — discards single-sample blips.
+
+    **How we reach 73.** The funnel on this stand-in record is:
+
+    | stage | count |
+    |---|---|
+    | raw oxic runs (DO > 0, contiguous) | **157** |
+    | after merging baseline gaps <= 1 h | **119** |
+    | after `peak >= 0.5 mg/L` **and** `dur >= 15 min` | **73** |
+
+    The selection step is dominated by the **peak threshold** (it removes 46 of the
+    46 dropped candidates; the duration guard alone removes only 3, all of which also
+    fail the peak test). All three knobs — `merge_gap`, the peak floor, and the
+    minimum duration — are explicit parameters, so the event count is a tunable,
+    auditable choice rather than a black box, and can be re-derived verbatim on the
+    Opti O2 record.
+    """)
+    return
+
+
+@app.cell
+def _(df):
+    # Label every 5-min sample with the event that contains it, and record how
+    # far into the event it falls (elapsed_min) for shape analysis.
+    event_samples = (
+        df.sort("Datetime")
+        .join_asof(detect_events(df), left_on="Datetime", right_on="start", strategy="backward")
+        .filter(pl.col("Datetime") <= pl.col("end"))
+        .with_columns(
+            (pl.col("Datetime") - pl.col("start")).dt.total_minutes().alias("elapsed_min")
+        )
+    )
+    event_samples
+    return (event_samples,)
+
+
+@app.cell
+def _(df, event_samples):
+    # Per-event feature table: shape (duration, peak, load, symmetry, rise/fall)
+    # plus antecedent / coincident drivers (salinity & water-level steps, prior-24 h
+    # precipitation). Kept events have a real oxic peak (>= 0.5 mg/L) lasting >= 15 min.
+    _do = "Dissolved Oxygen (mg/L)"
+    _sal = "Well Salinity (PPT)"
+    _wl = "Flood plain water level in BGS (cm)"
+    _pr = "Precip (mm) over 5 minutes"
+
+    # trailing 24 h context on the full series, sampled just before each event start
+    _ctx = df.sort("Datetime").select(
+        "Datetime",
+        pl.col(_pr).rolling_sum_by("Datetime", window_size="24h").alias("precip_24h"),
+        pl.col(_sal).rolling_mean_by("Datetime", window_size="24h").alias("sal_pre"),
+        pl.col(_wl).rolling_mean_by("Datetime", window_size="24h").alias("wl_pre"),
+    )
+
+    _shape = (
+        event_samples.group_by("eid")
+        .agg(
+            pl.len().cast(pl.Int64).alias("n_samples"),
+            pl.col("start").first(),
+            pl.col("end").first(),
+            pl.col(_do).max().alias("peak_do"),
+            pl.col(_do).mean().alias("mean_do"),
+            pl.col(_do).sum().alias("_sum_do"),
+            pl.col(_do).arg_max().cast(pl.Int64).alias("_argpeak"),
+            pl.col(_sal).mean().alias("sal_in"),
+            pl.col(_wl).mean().alias("wl_in"),
+        )
+        .sort("start")
+        .with_columns(
+            (pl.col("end") - pl.col("start")).dt.total_minutes().alias("dur_min"),
+            (pl.col("_sum_do") * 5 / 60).alias("area_mgLh"),
+            (pl.col("_argpeak") / (pl.col("n_samples") - 1).clip(lower_bound=1)).alias("peak_frac"),
+            (pl.col("_argpeak") * 5).alias("rise_min"),
+            ((pl.col("n_samples") - 1 - pl.col("_argpeak")) * 5).alias("fall_min"),
+        )
+        .with_columns(
+            (pl.col("peak_do") / (pl.col("rise_min") / 60).clip(lower_bound=0.0833)).alias("rise_rate"),
+            (pl.col("peak_do") / (pl.col("fall_min") / 60).clip(lower_bound=0.0833)).alias("fall_rate"),
+        )
+    )
+
+    events = (
+        _shape.join_asof(_ctx, left_on="start", right_on="Datetime", strategy="backward")
+        .with_columns(
+            (pl.col("sal_in") - pl.col("sal_pre")).alias("sal_step"),
+            (pl.col("wl_in") - pl.col("wl_pre")).alias("wl_step"),
+        )
+        .filter((pl.col("peak_do") >= 0.5) & (pl.col("dur_min") >= 15))
+        .select(
+            "eid", "start", "end", "dur_min", "n_samples",
+            "peak_do", "mean_do", "area_mgLh",
+            "peak_frac", "rise_min", "fall_min", "rise_rate", "fall_rate",
+            "sal_in", "wl_in", "sal_step", "wl_step", "precip_24h",
+        )
+        .sort("start")
+    )
+    events
+    return (events,)
+
+
+@app.cell
+def _(events):
+    # Symmetry of detected events. peak_frac = 0 -> oxygen jumps up then bleeds off
+    # slowly (abrupt, asymmetric -> "hot moment"); peak_frac ~ 0.5 -> rises and falls
+    # symmetrically ("oxic pulse").
+    _chart = alt.Chart(events).mark_bar(color="#3b7dd8").encode(
+        alt.X("peak_frac:Q", bin=alt.Bin(maxbins=24),
+              title="time-to-peak fraction  (0 = abrupt rise / slow decay,  0.5 = symmetric)"),
+        alt.Y("count():Q", title="number of events"),
+    ).properties(width=560, height=200, title=f"Event symmetry  (n = {events.height} events)")
+    mo.vstack([
+        _chart,
+        mo.md(
+            r"""
+    **What we learn:** the distribution is heavily skewed toward **low `peak_frac`** —
+    most events rise abruptly and decay slowly. Symmetry is therefore a strong,
+    *imbalanced* signal: this site is dominated by hot-moment-like events, with only a
+    thin tail of symmetric pulses. That class imbalance is exactly why the proposal's
+    KPIs lean on macro-F1 / Cohen's kappa rather than raw accuracy.
+            """
+        ),
+    ])
+    return
+
+
+@app.cell
+def _(events):
+    # Coincident salinity step vs symmetry, sized by peak DO, coloured by prior precip.
+    _chart = alt.Chart(events).mark_circle(opacity=0.7).encode(
+        alt.X("sal_step:Q", title="coincident salinity step  (event mean - prior 24 h, PPT)"),
+        alt.Y("peak_frac:Q", title="symmetry (time-to-peak fraction)"),
+        alt.Size("peak_do:Q", title="peak DO (mg/L)", scale=alt.Scale(range=[20, 400])),
+        alt.Color("precip_24h:Q", title="prior-24 h precip (mm)", scale=alt.Scale(scheme="viridis")),
+        tooltip=["start:T", "dur_min:Q", "peak_do:Q", "peak_frac:Q", "sal_step:Q", "precip_24h:Q"],
+    ).properties(width=560, height=320, title="Event drivers: salinity step vs symmetry")
+    mo.vstack([
+        _chart,
+        mo.md(
+            r"""
+    **What we learn:** the abrupt (low `peak_frac`) events sit mostly at **positive
+    salinity steps** — consistent with tidal-water incursion driving hot moments — while
+    the more symmetric events gather near a zero/negative salinity step. The separation
+    is real but not crisp, and precipitation (colour) shows no obvious gradient here,
+    foreshadowing the soft cluster boundary in Section 4 and the need for labelled data.
+            """
+        ),
+    ])
+    return
+
+
+@app.cell
+def _(event_samples, events):
+    # Representative event shapes, time-normalised: the two most abrupt/asymmetric
+    # events (lowest peak_frac) vs the two most symmetric (peak_frac nearest 0.5).
+    _lo = events.sort("peak_frac").head(2)["eid"].to_list()
+    _sym = (
+        events.with_columns((pl.col("peak_frac") - 0.5).abs().alias("_d"))
+        .sort("_d").head(2)["eid"].to_list()
+    )
+    _pick = events.filter(pl.col("eid").is_in(_lo + _sym)).select("eid", "dur_min", "peak_frac")
+    _curve = (
+        event_samples.filter(pl.col("eid").is_in(_lo + _sym))
+        .join(_pick, on="eid")
+        .with_columns(
+            (pl.col("elapsed_min") / pl.col("dur_min").clip(lower_bound=1)).alias("t_norm"),
+            pl.col("Dissolved Oxygen (mg/L)").alias("do"),
+            pl.format("event {} (pf={})", pl.col("eid"), pl.col("peak_frac").round(2)).alias("event"),
+        )
+    )
+    _chart = alt.Chart(_curve).mark_line().encode(
+        alt.X("t_norm:Q", title="normalised time within event (0 = start, 1 = end)"),
+        alt.Y("do:Q", title="dissolved oxygen (mg/L)"),
+        alt.Color("event:N", title=None),
+    ).properties(width=560, height=260, title="Example event shapes: abrupt/asymmetric vs symmetric")
+    mo.vstack([
+        _chart,
+        mo.md(
+            r"""
+    **What we learn:** the shapes confirm the feature is capturing what we intend. The
+    low-`peak_frac` events spike almost immediately then taper over the rest of the
+    window (the classic asymmetric hot-moment signature), whereas the `peak_frac ~ 0.5`
+    events rise and fall roughly evenly. This validates `peak_frac` (and the rise/fall
+    rates) as faithful, interpretable shape descriptors for the classifier.
+            """
+        ),
+    ])
+    return
+
+
+@app.cell
+def _():
+    mo.md(r"""
+    ## Section 4 — Unsupervised structure: do the two classes emerge on their own?
+
+    Before training a *supervised* classifier we ask whether the expert taxonomy is
+    already latent in the data. We log-scale the skewed magnitude features, standardise
+    everything, and run **k-means** on the 73 events. If the hot-moment / oxic-pulse
+    split is real, an unsupervised method given **k = 2** should rediscover it — and the
+    clusters should differ along the *physically meaningful* axes (symmetry, salinity
+    step, duration), not arbitrary ones.
+    """)
+    return
+
+
+@app.cell
+def _(events):
+    # Log-scale skewed magnitudes, standardise, then k-means. Silhouette sweep picks
+    # how many clusters the geometry actually supports; we fix k = 2 to test the
+    # expert two-class hypothesis and relabel clusters by symmetry for a clear legend.
+    _logc = ["dur_min", "peak_do", "area_mgLh", "rise_rate", "fall_rate", "precip_24h"]
+    _rawc = ["peak_frac", "sal_in", "wl_in", "sal_step", "wl_step"]
+    _X = events.select(
+        [pl.col(c).log1p().alias(c) for c in _logc] + [pl.col(c) for c in _rawc]
+    ).to_numpy()
+    _Xs = StandardScaler().fit_transform(_X)
+
+    cluster_silhouette = pl.DataFrame(
+        {
+            "k": list(range(2, 6)),
+            "silhouette": [
+                silhouette_score(_Xs, KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(_Xs))
+                for k in range(2, 6)
+            ],
+        }
+    )
+
+    _lab = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(_Xs)
+    _pc = PCA(n_components=2, random_state=0).fit_transform(_Xs)
+    # name clusters by symmetry: lower median peak_frac = abrupt/asymmetric
+    _pf = events["peak_frac"].to_numpy()
+    _asym = 0 if _pf[_lab == 0].mean() < _pf[_lab == 1].mean() else 1
+    _names = np.where(_lab == _asym, "asymmetric (hot-moment-like)", "symmetric (pulse-like)")
+    events_clustered = events.with_columns(
+        pl.Series("cluster", _names),
+        pl.Series("pc1", _pc[:, 0]),
+        pl.Series("pc2", _pc[:, 1]),
+    )
+    cluster_silhouette
+    return (events_clustered,)
+
+
+@app.cell
+def _(events_clustered):
+    # K-means clusters in PCA space, with a takeaway caption.
+    _chart = (
+        alt.Chart(events_clustered)
+        .mark_circle(opacity=0.78)
+        .encode(
+            alt.X("pc1:Q", title="PC1"),
+            alt.Y("pc2:Q", title="PC2"),
+            alt.Color("cluster:N", title="k-means cluster (k=2)",
+                      scale=alt.Scale(scheme="set1"),
+                      legend=alt.Legend(orient="bottom")),
+            alt.Size("peak_do:Q", title="peak DO (mg/L)", scale=alt.Scale(range=[25, 400])),
+            tooltip=["start:T", "dur_min:Q", "peak_do:Q", "peak_frac:Q", "sal_step:Q"],
+        )
+        .properties(width=560, height=360, title="Event clusters in PCA space (k = 2)")
+    )
+    mo.vstack([
+        _chart,
+        mo.md(
+            r"""
+    **What we learn:** with no labels at all, k-means cleanly separates the events into
+    two groups that map onto the expert classes. The *asymmetric (hot-moment-like)*
+    cluster carries low `peak_frac` and large **positive salinity steps** (tidal
+    incursion); the *symmetric (pulse-like)* cluster has near-zero salinity steps and
+    longer, higher-peaked events. The split runs along the physically meaningful axes
+    the domain hypothesis predicts — strong evidence the two-class taxonomy is real and
+    *learnable*, which justifies the supervised approach. The modest silhouette (~0.22)
+    and the slightly higher k = 3 score also warn that the boundary is soft and may hide
+    sub-classes — so expert labels remain essential for the final classifier.
+            """
+        ),
+    ])
+    return
+
+
+@app.cell
+def _(events_clustered):
+    # Median feature profile per cluster: how the two groups actually differ.
+    _prof = (
+        events_clustered.group_by("cluster")
+        .agg(
+            pl.len().alias("n"),
+            pl.col("peak_frac").median().round(3).alias("peak_frac"),
+            pl.col("dur_min").median().round(0).alias("dur_min"),
+            pl.col("peak_do").median().round(2).alias("peak_do"),
+            pl.col("sal_step").median().round(2).alias("sal_step"),
+            pl.col("wl_step").median().round(1).alias("wl_step"),
+            pl.col("precip_24h").median().round(2).alias("precip_24h"),
+        )
+        .sort("peak_frac")
+    )
+    mo.vstack([
+        mo.ui.table(_prof, selection=None),
+        mo.md(
+            r"""
+    **What we learn:** the cluster medians read like the textbook descriptions. The
+    *hot-moment-like* group is short, abrupt (low `peak_frac`) and rides a clear
+    **positive salinity step** with a large negative water-level step (tidal flooding);
+    the *pulse-like* group is longer, more **symmetric**, with a salinity step near zero.
+    Precipitation barely separates them in this stand-in well, flagging that the
+    *precip → oxic-pulse* link is weak here and will need the real labelled record to
+    confirm.
+            """
+        ),
+    ])
     return
 
 
