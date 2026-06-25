@@ -5,7 +5,24 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "anthropic[mcp]>=0.109.1",
+    "catboost>=1.2.10",
+    "google-genai[aiohttp,local-tokenizer]>=2.8.0",
     "marimo[recommended]>=0.23.8",
+    "mcp>=1.27.2",
     "numpy>=2.4.6",
     "scikit-learn>=1.9.0",
+    "shap>=0.52.0",
+    "tabpfn>=8.0.8",
+    "torch>=2.12.0",
+    "ty-extensions>=0.1.0",
+    "xgboost>=3.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "python-lsp-ruff>=2.3.1",
+    "python-lsp-server>=1.14.0",
+    "ty>=0.0.49",
+    "websockets>=16.0",
 ]

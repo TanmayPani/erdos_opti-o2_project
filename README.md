@@ -1,16 +1,35 @@
 # Opti O2
 [proposal](PROPOSAL.md)
 
-Exploratory analysis of dissolved-oxygen dynamics in a flood-plain monitoring
-well, using a 5-minute-cadence environmental record from **Beaver Creek, WA**
-(2019-06-26 → 2024-09-30, ~554k rows): dissolved oxygen, salinity, water level,
-and co-located weather (solar flux, air temperature, precipitation, barometric
-pressure, humidity, …).
+An end-to-end, reproducible pipeline that **detects and classifies
+dissolved-oxygen "events"** — *hot moments* (abrupt, tidally-driven) vs *oxic
+pulses* (symmetric, precipitation-driven) — in a 5-minute-cadence environmental
+record from **Beaver Creek, WA** (2019-06-26 → 2024-09-30, ~554k rows):
+dissolved oxygen, salinity, water level, and co-located weather (solar flux, air
+temperature, precipitation, barometric pressure, humidity, …).
 
-The analysis lives in a [marimo](https://marimo.io) reactive notebook,
-[`exploratory.py`](exploratory.py), which builds graphs showing the dataset's
-**multimodality** (zero-inflated DO, multi-regime salinity) and its **multiple
-time-scales** (diurnal, synoptic, and seasonal cycles, plus an FFT periodogram).
+## Contingency note — labels
+
+The project's supervised target is Opti O2's **expert event labels**, which are
+**under NDA and not yet delivered**. So that the work stands on its own, the
+pipeline is built and validated entirely on the public ESS-DIVE stand-in, with
+the classifier trained on a **physics-grounded weak-supervision label**
+(`ws_label`) that encodes the published hot-moment vs oxic-pulse taxonomy as
+labeling functions. Everything is driven by a single `LABEL_COL` switch in
+[`modeling.py`](modeling.py): point it at the real expert column on delivery and
+the whole pipeline re-runs unchanged.
+
+## The pipeline (three [marimo](https://marimo.io) notebooks)
+
+| Notebook | Role |
+|---|---|
+| [`exploratory.py`](exploratory.py) | EDA (multimodality, multi-scale FFT), **event detection**, event-shape + antecedent feature engineering, k-means clusters, and **§4b weak-supervision labels**. Hands off `derived/{events,event_samples}.parquet`. |
+| [`modeling.py`](modeling.py) | **Dual-track classifier** — Track A gradient boosting (XGBoost / CatBoost / Logistic) on engineered features; Track B deep learning (ROCKET / contrastive SSL / InceptionTime / transformer) on raw 5-min sequences — through one leakage-checked CV harness. |
+| [`discovery.py`](discovery.py) | **Unsupervised driver discovery** (label-free): does the taxonomy emerge from the geometry, which drivers carry the class signal, and is the hot-moment fraction drifting over the six-year record. |
+
+On the stand-in labels the boosting models reach **macro-F1 ≈ 0.92–0.95,
+Cohen's κ ≈ 0.85–0.90**; shuffling the labels collapses performance to chance
+(≈ 0.51 macro-F1), confirming the harness is leakage-free.
 
 ## Prerequisites
 
@@ -87,9 +106,16 @@ rows, a trailing spacer column, and physically impossible sentinel values.
 
 ```
 opti-o2/
-├── exploratory.py    # the marimo analysis notebook
+├── exploratory.py    # EDA + event detection + features + weak-supervision labels
+├── modeling.py       # dual-track event classifier (Track A boosting, Track B deep learning)
+├── discovery.py      # unsupervised driver discovery (label-free)
+├── derived/          # parquet hand-off written by exploratory.py, read by the other two
 ├── datasets/         # ESS-DIVE source data
 ├── pyproject.toml    # project metadata and dependencies
 ├── uv.lock           # pinned, reproducible dependency versions
 └── .python-version   # pinned Python (3.14)
 ```
+
+The full pipeline (`exploratory.py` → `derived/` → `modeling.py` + `discovery.py`)
+re-runs from a clean kernel in **well under a minute** — so it can be re-run
+verbatim on the Opti O2 NDA dataset the moment it is delivered.
