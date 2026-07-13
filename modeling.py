@@ -1,883 +1,849 @@
 import marimo
 
-__generated_with = "0.23.8"
-app = marimo.App(width="full")
+__generated_with = "0.23.14"
+app = marimo.App(width="full", layout_file="layouts/modeling.slides.json")
 
 with app.setup:
-    import os
+    import marimo as mo
+    import altair as alt
+
     import warnings
     from pathlib import Path
 
-    import marimo as mo
     import numpy as np
     import polars as pl
-    import altair as alt
+    import torch
 
-    from sklearn.model_selection import RepeatedStratifiedKFold
-    from sklearn.preprocessing import StandardScaler, label_binarize
-    from sklearn.impute import SimpleImputer
-    from sklearn.pipeline import make_pipeline
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.utils.class_weight import compute_sample_weight, compute_class_weight
-    from sklearn.metrics import (
-        f1_score,
-        balanced_accuracy_score,
-        cohen_kappa_score,
-        matthews_corrcoef,
-        roc_auc_score,
-        average_precision_score,
-    )
+    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.utils.class_weight import compute_sample_weight
 
-    import xgboost as xgb
-    from catboost import CatBoostClassifier
     import shap
 
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
+    from sklearn.impute import SimpleImputer
+    from tabpfn import TabPFNClassifier
+
+    # TabPFN's own interpretability (shapiq imputation explainer) — optional dep
+    # (`uv pip install "tabpfn-extensions[interpretability]"`); guarded so the notebook
+    # still loads without it (the TabPFN-SHAP cell degrades to a hint).
+    try:
+        from tabpfn_extensions.interpretability.shapiq import (
+            get_tabpfn_imputation_explainer,
+        )
+        from tabpfn_extensions.interpretability.shap import shapiq_to_shap_explanation
+    except ImportError:
+        get_tabpfn_imputation_explainer = None
+        shapiq_to_shap_explanation = None
+
+    from core.features import FEATURE_COLS, MOMENT_FEATURE_COLS
+    from core.model import RocketTransform
+
+    # All model factories, CV harnesses, data readers, and the results formatter
+    # live in `training.py` — the plain script that runs the full grouped-CV sweep
+    # and writes `derived/model_results.parquet`. This notebook only *loads* those
+    # precomputed tables and adds the SHAP / boundary explainability on top.
+    from training import (
+        fmt_stat,
+        display_table,
+        compare_modes,
+        xgb_fn,
+        logreg_fn,
+        inception_fn,
+        read_tabular_features,
+        read_time_series_curves,
+    )
 
     warnings.filterwarnings("ignore")
     alt.data_transformers.disable_max_rows()
 
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    # Event classification — modeling
-
-    Two tracks in tandem on the detected dissolved-oxygen events:
-
-    - **Track A — gradient-boosting baseline** on the engineered per-event
-      feature table (`derived/events.parquet`).
-    - **Track B — deep learning** on the raw 5-min event sequences
-      (`derived/event_samples.parquet`).
-
-    > ⚠️ **Scaffold caveat.** The target is `ws_label`, the **physics-grounded
-    > weak-supervision label** from the EDA notebook (§4b) — a defensible
-    > stand-in for the NDA expert labels, built by encoding the published
-    > hot-moment vs oxic-pulse taxonomy as labeling functions. It is *not*
-    > circular the way the k-means `cluster` is, but **Track A is still partly
-    > circular**: the labeling functions read some of the same engineered
-    > features Track A trains on, so read Track A as an upper bound. **Track B
-    > learns from the raw 5-min shape with no hand features — it is the fairer
-    > test, so we lead the discussion with it.** Flip `LABEL_COL` to the real
-    > expert column (one line) when it lands; set it to `cluster` or a shuffled
-    > column to reproduce the unsupervised / leakage-check rows.
-    """)
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## M0 — Foundation (shared by both tracks)
-    """)
-    return
+    LABEL_COL = "label"
 
 
 @app.cell
 def _():
-    # Derived artifacts written by exploratory.py's hand-off cell.
-    _derived = Path(mo.notebook_location()) / "derived"
-    events = pl.read_parquet(_derived / "events.parquet")
-    event_samples = pl.read_parquet(_derived / "event_samples.parquet")
-
-    # The single scaffold switch: point this at the real expert-label column
-    # once it exists in events.parquet; nothing else changes. Default is the
-    # physics-grounded weak-supervision target `ws_label` (exploratory.py §4b);
-    # set to "cluster" for the unsupervised pseudo-label, or a shuffled column
-    # for the leakage check.
-    LABEL_COL = "ws_label"
-    return LABEL_COL, event_samples, events
-
-
-@app.cell
-def _(LABEL_COL, events):
-    # Engineered numeric features. We DROP identifiers (eid/start/end), the label
-    # itself, the cluster-DERIVED columns (cluster_rank/is_abrupt/pc1/pc2), and
-    # every weak-supervision artifact (ws_* aggregates + lf_* votes) — all of
-    # which leak the target directly.
-    DROP_COLS = {
-        "eid",
-        "start",
-        "end",
-        LABEL_COL,
-        "cluster",
-        "cluster_rank",
-        "is_abrupt",
-        "pc1",
-        "pc2",
+    _METRIC_ORDER = ["macro_f1", "bal_acc", "roc_auc", "pr_auc", "mcc", "kappa"]
+    _METRIC_LABEL = {
+        "macro_f1": "F1-score",
+        "bal_acc": "Balanced Acc.",
+        "roc_auc": "ROC-AUC",
+        "pr_auc": "PR-AUC",
+        "mcc": "Matthew's Corr.",
+        "kappa": "Cohen\u2019s \u03ba",
     }
-    feature_cols = [
-        c
-        for c in events.columns
-        if c not in DROP_COLS and not c.startswith("ws_") and not c.startswith("lf_")
-    ]
+    _METRIC_CHANCE = {
+        "macro_f1": 0.5,
+        "bal_acc": 0.5,
+        "roc_auc": 0.5,
+        "mcc": 0.0,
+        "kappa": 0.0,
+    }
 
-    X = events.select(feature_cols).to_numpy().astype(float)
-    class_names = sorted(events[LABEL_COL].unique().to_list())
-    _c2i = {c: i for i, c in enumerate(class_names)}
-    y = np.array([_c2i[v] for v in events[LABEL_COL].to_list()])
+    def metric_bar_tabs(frame, table, sort="macro_f1", height=300):
+        """Per-table metric reporting as bar charts (models on x, one tab per metric),
+        reading the tidy `model_results` frame [table, model, metric, mean, std]. Bars carry
+        +/-std whiskers where present and a dashed chance reference (0.5 for F1 / bal-acc /
+        ROC-AUC, 0 for MCC / kappa). Model order is shared across tabs (ranked by `sort`)."""
+        sub = frame.filter(pl.col("table") == table)
+        if sub.height == 0:
+            return mo.md(f"> no rows for table `{table}`.")
+        metrics = [m for m in _METRIC_ORDER if m in set(sub["metric"].to_list())]
+        _sm = sort if sort in metrics else metrics[0]
+        order = (
+            sub.filter(pl.col("metric") == _sm)
+            .sort("mean", descending=True)["model"]
+            .to_list()
+        )
+        width = max(340, 78 * len(order))
+        tabs = {}
+        for m in metrics:
+            d = sub.filter(pl.col("metric") == m).with_columns(
+                (pl.col("mean") - pl.col("std")).alias("lo"),
+                (pl.col("mean") + pl.col("std")).alias("hi"),
+            )
+            unit = m in ("macro_f1", "bal_acc", "roc_auc", "pr_auc")
+            _lo = float((d["mean"] - d["std"].fill_null(0.0)).min())
+            dom = [0, 1] if unit else [min(-0.05, _lo), 1.0]
+            base = alt.Chart(d).encode(
+                x=alt.X(
+                    "model:N", sort=order, title=None, axis=alt.Axis(labelAngle=-30)
+                )
+            )
+            bars = base.mark_bar().encode(
+                y=alt.Y("mean:Q", title=_METRIC_LABEL[m], scale=alt.Scale(domain=dom)),
+                color=alt.Color(
+                    "model:N",
+                    sort=order,
+                    legend=None,
+                    scale=alt.Scale(scheme="tableau10"),
+                ),
+                tooltip=[
+                    "model:N",
+                    alt.Tooltip("mean:Q", format=".3f"),
+                    alt.Tooltip("std:Q", format=".3f"),
+                ],
+            )
+            whisker = base.mark_rule(strokeWidth=1.5, color="white").encode(
+                y="lo:Q", y2="hi:Q"
+            )
+            labels = base.mark_text(
+                angle=315,
+                align="left",
+                baseline="bottom",
+                dx=5,
+                dy=-4,
+                fontSize=11,
+                color="white",
+            ).encode(y="mean:Q", text=alt.Text("mean:Q", format=".2f"))
+            layers = [bars, whisker, labels]
+            if m in _METRIC_CHANCE:
+                layers.append(
+                    alt.Chart(pl.DataFrame({"y": [_METRIC_CHANCE[m]]}))
+                    .mark_rule(color="#c1440e", strokeDash=[4, 3])
+                    .encode(y="y:Q")
+                )
+            tabs[_METRIC_LABEL[m]] = alt.layer(*layers).properties(
+                width=width, height=height
+            )
+        return mo.ui.tabs(tabs)
+
+    def metric_bars_grouped(frame, modes, sort="macro_f1", height=340):
+        """Grouped metric bars across evaluation `modes` — models on the x-axis, one bunched
+        bar per mode within each model, one tab per metric. `modes` maps a display label ->
+        table name in the tidy `model_results` frame; absent tables are skipped. +/-std
+        whiskers (white) where present; dashed chance reference. Mode order follows `modes`;
+        model order ranks by `sort` on the first mode."""
+        present = {l: t for l, t in modes.items() if t in set(frame["table"].to_list())}
+        if not present:
+            return mo.md("> no matching tables in `model_results`.")
+        sub = frame.filter(pl.col("table").is_in(list(present.values()))).with_columns(
+            pl.col("table").replace({t: l for l, t in present.items()}).alias("mode")
+        )
+        mode_order = list(present.keys())
+        metrics = [m for m in _METRIC_ORDER if m in set(sub["metric"].to_list())]
+        _ref = list(present.values())[0]
+        _sm = sort if sort in metrics else metrics[0]
+        order = (
+            sub.filter((pl.col("table") == _ref) & (pl.col("metric") == _sm))
+            .sort("mean", descending=True)["model"]
+            .to_list()
+        )
+        for _m in sub["model"].unique(maintain_order=True).to_list():
+            if _m not in order:
+                order.append(_m)
+        width = max(440, 116 * len(order))
+        tabs = {}
+        for metric in metrics:
+            d = sub.filter(pl.col("metric") == metric).with_columns(
+                (pl.col("mean") - pl.col("std")).alias("lo"),
+                (pl.col("mean") + pl.col("std")).alias("hi"),
+            )
+            unit = metric in ("macro_f1", "bal_acc", "roc_auc", "pr_auc")
+            _lo = float((d["mean"] - d["std"].fill_null(0.0)).min())
+            dom = [0, 1] if unit else [min(-0.05, _lo), 1.0]
+            base = alt.Chart(d).encode(
+                x=alt.X(
+                    "model:N", sort=order, title=None, axis=alt.Axis(labelAngle=-30)
+                ),
+                xOffset=alt.XOffset("mode:N", sort=mode_order),
+            )
+            bars = base.mark_bar().encode(
+                y=alt.Y(
+                    "mean:Q", title=_METRIC_LABEL[metric], scale=alt.Scale(domain=dom)
+                ),
+                color=alt.Color(
+                    "mode:N",
+                    sort=mode_order,
+                    title="mode",
+                    scale=alt.Scale(scheme="tableau10"),
+                    legend=alt.Legend(orient="bottom"),
+                ),
+                tooltip=[
+                    "model:N",
+                    "mode:N",
+                    alt.Tooltip("mean:Q", format=".3f"),
+                    alt.Tooltip("std:Q", format=".3f"),
+                ],
+            )
+            whisker = base.mark_rule(strokeWidth=1.2, color="white").encode(
+                y="lo:Q", y2="hi:Q"
+            )
+            layers = [bars, whisker]
+            if metric in _METRIC_CHANCE:
+                layers.append(
+                    alt.Chart(pl.DataFrame({"y": [_METRIC_CHANCE[metric]]}))
+                    .mark_rule(color="#c1440e", strokeDash=[4, 3])
+                    .encode(y="y:Q")
+                )
+            tabs[_METRIC_LABEL[metric]] = alt.layer(*layers).properties(
+                width=width, height=height
+            )
+        return mo.ui.tabs(tabs)
+
+    def metric_bars_routes(frames, table, sort="macro_f1", height=340):
+        """Grouped metric bars comparing classification routes for one CV `table` — models on
+        the x-axis, one bunched bar per route within each model, one tab per metric. `frames`
+        maps a route label -> its tidy results frame. +/-std whiskers (white); dashed chance
+        reference; route order follows `frames`."""
+        parts, route_order = [], []
+        for route, fr in frames.items():
+            s = fr.filter(pl.col("table") == table)
+            if s.height:
+                parts.append(s.with_columns(pl.lit(route).alias("route")))
+                route_order.append(route)
+        if not parts:
+            return mo.md(f"> no rows for table `{table}`.")
+        sub = pl.concat(parts)
+        metrics = [m for m in _METRIC_ORDER if m in set(sub["metric"].to_list())]
+        _sm = sort if sort in metrics else metrics[0]
+        order = (
+            sub.filter((pl.col("route") == route_order[0]) & (pl.col("metric") == _sm))
+            .sort("mean", descending=True)["model"]
+            .to_list()
+        )
+        for _m in sub["model"].unique(maintain_order=True).to_list():
+            if _m not in order:
+                order.append(_m)
+        width = max(440, 116 * len(order))
+        tabs = {}
+        for metric in metrics:
+            d = sub.filter(pl.col("metric") == metric).with_columns(
+                (pl.col("mean") - pl.col("std")).alias("lo"),
+                (pl.col("mean") + pl.col("std")).alias("hi"),
+            )
+            unit = metric in ("macro_f1", "bal_acc", "roc_auc", "pr_auc")
+            _lo = float((d["mean"] - d["std"].fill_null(0.0)).min())
+            dom = [0, 1] if unit else [min(-0.05, _lo), 1.0]
+            base = alt.Chart(d).encode(
+                x=alt.X(
+                    "model:N", sort=order, title=None, axis=alt.Axis(labelAngle=-30)
+                ),
+                xOffset=alt.XOffset("route:N", sort=route_order),
+            )
+            bars = base.mark_bar().encode(
+                y=alt.Y(
+                    "mean:Q", title=_METRIC_LABEL[metric], scale=alt.Scale(domain=dom)
+                ),
+                color=alt.Color(
+                    "route:N",
+                    sort=route_order,
+                    title="route",
+                    scale=alt.Scale(scheme="set2"),
+                    legend=alt.Legend(orient="bottom"),
+                ),
+                tooltip=[
+                    "model:N",
+                    "route:N",
+                    alt.Tooltip("mean:Q", format=".3f"),
+                    alt.Tooltip("std:Q", format=".3f"),
+                ],
+            )
+            whisker = base.mark_rule(strokeWidth=1.2, color="white").encode(
+                y="lo:Q", y2="hi:Q"
+            )
+            layers = [bars, whisker]
+            if metric in _METRIC_CHANCE:
+                layers.append(
+                    alt.Chart(pl.DataFrame({"y": [_METRIC_CHANCE[metric]]}))
+                    .mark_rule(color="#c1440e", strokeDash=[4, 3])
+                    .encode(y="y:Q")
+                )
+            tabs[_METRIC_LABEL[metric]] = alt.layer(*layers).properties(
+                width=width, height=height
+            )
+        return mo.ui.tabs(tabs)
+
+    return metric_bars_grouped, metric_bars_routes
+
+
+@app.function
+@mo.persistent_cache
+def rocket_shap_panel(X_rocket, specs, class_names, y):
+    """SHAP over the ROCKET features (XGBoost head), summed back to each kernel's
+    (channel · dilation · pool) tag → an hstack of (channel reliance, time-scale
+    reliance by dilation, top-kernel direction beeswarm). Shared by the excursion and
+    moment routes — pass that route's kernel `specs` (rocket.module_.kernel_specs(),
+    deterministic given the seed) so the cache key stays stable across kernels."""
+    clf = xgb_fn()
+    clf.fit(X_rocket, y, sample_weight=compute_sample_weight("balanced", y))
+    sv = shap.TreeExplainer(clf)(X_rocket).values  # (n_rows, 2*n_kernels)
+
+    # map every feature back to its kernel spec (feature 2k -> max, 2k+1 -> ppv of k).
+    channels = ["do", "sal", "wl", "temp", "precip"]
+    k = np.arange(sv.shape[1]) // 2
+    feat_ch = np.asarray(specs["channel"])[k]
+    feat_dil = np.asarray(specs["dilation"])[k]
+    feat_type = np.where(np.arange(sv.shape[1]) % 2 == 0, "max", "ppv")
+    mean_abs = np.abs(sv).mean(axis=0)
+
+    feat_df = pl.DataFrame(
+        {
+            "mean_abs_shap": mean_abs.astype(float),
+            "channel": [channels[c] for c in feat_ch],
+            "dilation": feat_dil.astype(int),
+            "type": feat_type,
+        }
+    )
+
+    # 1) Channel reliance — Σ mean|SHAP| over all kernels on each channel.
+    by_ch = (
+        feat_df.group_by("channel")
+        .agg(pl.col("mean_abs_shap").sum().alias("shap"))
+        .sort("shap", descending=True)
+    )
+    chart_ch = (
+        alt.Chart(by_ch)
+        .mark_bar()
+        .encode(
+            alt.X("channel:N", sort="-y", title="Channel"),
+            alt.Y("shap:Q", title="Σ mean|SHAP|"),
+            color=alt.Color("channel:N", legend=None),
+            tooltip=["channel", alt.Tooltip("shap:Q", format=".3f")],
+        )
+        .properties(width=300, height=250, title="Channel reliance (Σ mean|SHAP|)")
+    )
+
+    # 2) Time-scale reliance — Σ mean|SHAP| by dilation, split by pooling type.
+    by_dil = (
+        feat_df.group_by(["dilation", "type"])
+        .agg(pl.col("mean_abs_shap").sum().alias("shap"))
+        .sort("dilation")
+    )
+    chart_dil = (
+        alt.Chart(by_dil)
+        .mark_bar()
+        .encode(
+            alt.X("dilation:O", title="Dilation (time scale)"),
+            alt.Y("shap:Q", title="Σ mean|SHAP|"),
+            color=alt.Color("type:N", title="Pool"),
+            tooltip=["dilation", "type", alt.Tooltip("shap:Q", format=".3f")],
+        )
+        .properties(width=400, height=250, title="Time-scale reliance by dilation")
+    )
+
+    # 3) Direction — beeswarm of the top-12 kernels, per-row SHAP coloured by
+    #    (normalized) kernel activation, so red-right / red-left reads the push per class.
+    top = np.argsort(mean_abs)[::-1][:12]
+    rng = np.random.RandomState(0)
+    bee_rows = []
+    for f in top:
+        label = f"{channels[feat_ch[f]]}·d{int(feat_dil[f])}·{feat_type[f]}#{f // 2}"
+        col = X_rocket[:, f].astype(float)
+        lo, hi = np.nanmin(col), np.nanmax(col)
+        norm = (col - lo) / (hi - lo) if hi > lo else np.full_like(col, 0.5)
+        for i in range(len(col)):
+            bee_rows.append(
+                {
+                    "kernel": label,
+                    "shap": float(sv[i, f]),
+                    "act_norm": None if np.isnan(norm[i]) else float(norm[i]),
+                    "jitter": float(rng.uniform(-0.35, 0.35)),
+                }
+            )
+    bee_df = pl.DataFrame(bee_rows)
+    order = list(dict.fromkeys(r["kernel"] for r in bee_rows))
+    bee = (
+        alt.Chart(bee_df)
+        .mark_circle(size=26, opacity=0.65)
+        .encode(
+            x=alt.X(
+                "shap:Q", title=f"SHAP value  (◀ {class_names[0]} · {class_names[1]} ▶)"
+            ),
+            y=alt.Y("kernel:N", sort=order, title=None),
+            yOffset="jitter:Q",
+            color=alt.Color(
+                "act_norm:Q",
+                scale=alt.Scale(scheme="redblue", reverse=True),
+                title="kernel activation (low → high)",
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=["kernel", alt.Tooltip("shap:Q", format=".3f")],
+        )
+        .properties(width=460, height=320, title="Top kernels — direction & magnitude")
+    )
+    zero = (
+        alt.Chart(pl.DataFrame({"z": [0.0]}))
+        .mark_rule(color="#888", strokeDash=[4, 3])
+        .encode(x="z:Q")
+    )
+    return mo.vstack([mo.hstack([chart_ch, bee + zero], justify="start"), chart_dil])
+
+
+@app.function
+@mo.persistent_cache
+def shap_feature_panel(X, y, class_names, feature_cols, topk=12):
+    """XGBoost + TreeExplainer SHAP for one tabular route → an hstack of (mean-|SHAP|
+    bar, per-row beeswarm coloured by feature value). Shared by the excursion and moment
+    routes — pass that route's `FEATURE_COLS` / `MOMENT_FEATURE_COLS`. Balanced-weighted
+    full-data fit; read directions, not precise magnitudes, at this small n."""
+    clf = xgb_fn()
+    clf.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
+    sv = shap.TreeExplainer(clf)(X).values  # (n_rows, n_features)
+
+    imp = pl.DataFrame(
+        {
+            "feature": feature_cols,
+            "mean_abs_shap": np.abs(sv).mean(axis=0).astype(float),
+            "xgb_gain": clf.feature_importances_.astype(float),
+        }
+    ).sort("mean_abs_shap", descending=True)
+    top = imp["feature"].to_list()[:topk]
+
+    # one dot per (row, top-feature), coloured by the per-feature min-max normalized
+    # value, with vertical jitter to reduce overplotting.
+    rng = np.random.RandomState(0)
+    bee_rows = []
+    for f in top:
+        j = feature_cols.index(f)
+        col = X[:, j].astype(float)
+        lo, hi = np.nanmin(col), np.nanmax(col)
+        norm = (col - lo) / (hi - lo) if hi > lo else np.full_like(col, 0.5)
+        for i in range(len(col)):
+            bee_rows.append(
+                {
+                    "feature": f,
+                    "shap": float(sv[i, j]),
+                    "feat_norm": None if np.isnan(norm[i]) else float(norm[i]),
+                    "value": None if np.isnan(col[i]) else float(col[i]),
+                    "jitter": float(rng.uniform(-0.35, 0.35)),
+                }
+            )
+    bee_df = pl.DataFrame(bee_rows)
+
+    bar = (
+        alt.Chart(imp.head(topk))
+        .mark_bar(color="#4575b4")
+        .encode(
+            alt.X("mean_abs_shap:Q", title="mean |SHAP| (log-odds)"),
+            alt.Y("feature:N", sort=top, title=None),
+            tooltip=[
+                "feature:N",
+                alt.Tooltip("mean_abs_shap:Q", format=".3f"),
+                alt.Tooltip("xgb_gain:Q", format=".3f"),
+            ],
+        )
+        .properties(width=300, height=430, title="Global importance — mean |SHAP|")
+    )
+    bee = (
+        alt.Chart(bee_df)
+        .mark_circle(size=26, opacity=0.65)
+        .encode(
+            x=alt.X(
+                "shap:Q",
+                title=f"SHAP value  (◀ {class_names[0]} · {class_names[1]} ▶)",
+            ),
+            y=alt.Y("feature:N", sort=top, title=None),
+            yOffset="jitter:Q",
+            color=alt.Color(
+                "feat_norm:Q",
+                scale=alt.Scale(scheme="redblue", reverse=True),
+                title="feature value (low → high)",
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=[
+                "feature:N",
+                alt.Tooltip("value:Q", format=".3g"),
+                alt.Tooltip("shap:Q", format=".3f"),
+            ],
+        )
+        .properties(width=440, height=430, title="Per-row SHAP — direction & magnitude")
+    )
+    zero = (
+        alt.Chart(pl.DataFrame({"z": [0.0]}))
+        .mark_rule(color="#888", strokeDash=[4, 3])
+        .encode(x="z:Q")
+    )
+    return mo.hstack([bar, bee + zero], justify="start")
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    # Event classification
+
+    Classifying detected dissolved-oxygen excursions as **hot moment** vs **oxic
+    pulse**, on the real **NDA expert labels** (via `preprocessing.py` →
+    `derived/proc_features.parquet`). *Mixed* (`hx`) events and the undefined `b`
+    subtype are held out (`split=="holdout"`) — the next section asks where the
+    binary model puts them.
+
+    - **Unit** = an auto-detected DO excursion, nested in the expert umbrella that
+      supplies its class (`group_id`); a few audited orphans were adopted with
+      `label_source="inferred"`.
+    - **Target** = binary `label` on `split=="train"`; only the 24 `FEATURE_COLS`
+      enter X (metadata columns never do). Live counts are printed by the load cell
+      below.
+    - **CV** = **StratifiedGroupKFold on `group_id`** so an umbrella's nested units
+      never straddle a fold (the leakage the old plain-stratified harness allowed),
+      plus **leave-one-group-out** as a small-*n* robustness estimate. Metrics lead
+      with **macro-F1** and **balanced accuracy** (the class imbalance).
+
+    Two tracks: **A** — gradient-boosting / linear on the engineered features;
+    **B** — deep learning on the raw `proc_curves.parquet` 128×5 sequences.
+    """)
+    return
+
+
+@app.cell
+def _():
+    X, y, class_names, train = read_tabular_features("derived/proc_features.parquet")
     class_labels = list(range(len(class_names)))
+    groups = train["group_id"].to_numpy()
 
+    proc = pl.read_parquet("derived/proc_features.parquet")
+    # Precomputed grouped-CV sweeps (all tables, mean ± std) — this notebook loads them
+    # rather than re-running TabPFN / ROCKET / InceptionTime folds. `training.py` writes
+    # one per route: `model_results.parquet` (excursion, `--mode excursion`) and
+    # `model_results_moment.parquet` (`--mode moment`). The moment file may be absent
+    # (route not yet run) → the route-comparison cell degrades to excursion-only.
+    model_results = pl.read_parquet("derived/model_results.parquet")
+    _mom_path = Path("derived/model_results_moment.parquet")
+    model_results_moment = pl.read_parquet(_mom_path) if _mom_path.exists() else None
+
+    _mom_note = (
+        f"{model_results_moment['table'].n_unique()} tables"
+        if model_results_moment is not None
+        else "**absent** — run `training.py --mode moment`"
+    )
     mo.md(
         f"""
-        **Design matrix:** {X.shape[0]} events × {X.shape[1]} engineered features.
-        **Classes ({len(class_names)}):** {", ".join(f"`{c}`" for c in class_names)};
-        counts = {np.bincount(y).tolist()}.
+        - **Loaded** `proc_features` — {proc.height} units; **{train.height} trainable**
+        (split=="train"), {proc.filter(pl.col("split") == "holdout").height} held out
+        (mixed + `b`). Target = `{LABEL_COL}` (hot vs pulse).
+
+        - **Design matrix:** {X.shape[0]} units × {X.shape[1]} features over
+        {len(set(groups))} CV groups. **Classes:**
+        {", ".join(f"`{c}`" for c in class_names)}; counts = {np.bincount(y).tolist()}
+        (base rate {np.bincount(y).max() / len(y):.0%}).
+
+        - **Results:** excursion route `derived/model_results.parquet`
+        ({model_results["table"].n_unique()} CV tables); moment route {_mom_note}
+        (both precomputed by `training.py`).
         """
     )
-    return X, class_labels, class_names, feature_cols, y
-
-
-@app.function
-def evaluate(y_true, y_pred, y_proba=None, labels=None):
-    """Multiclass-safe metric bundle. PR/ROC-AUC use macro one-vs-rest."""
-    y_true = np.asarray(y_true).ravel()
-    y_pred = np.asarray(y_pred).ravel()
-    out = {
-        "macro_f1": f1_score(y_true, y_pred, average="macro"),
-        "bal_acc": balanced_accuracy_score(y_true, y_pred),
-        "kappa": cohen_kappa_score(y_true, y_pred),
-        "mcc": matthews_corrcoef(y_true, y_pred),
-    }
-    if y_proba is not None and labels is not None:
-        Yb = label_binarize(y_true, classes=labels)
-        if Yb.shape[1] == 1:  # binary
-            out["roc_auc"] = roc_auc_score(y_true, y_proba[:, 1])
-            out["pr_auc"] = average_precision_score(y_true, y_proba[:, 1])
-        else:
-            out["roc_auc"] = roc_auc_score(Yb, y_proba, average="macro", multi_class="ovr")
-            out["pr_auc"] = average_precision_score(Yb, y_proba, average="macro")
-    return out
-
-
-@app.cell
-def _():
-    def _fit(make_model, Xtr, ytr):
-        """Fit with balanced sample weights; fall back when unsupported."""
-        m = make_model()
-        sw = compute_sample_weight("balanced", ytr)
-        try:
-            m.fit(Xtr, ytr, sample_weight=sw)
-        except (TypeError, ValueError):
-            m.fit(Xtr, ytr)
-        return m
-
-
-    def repeated_stratified_cv(make_model, X, y, labels, n_splits=5, n_repeats=5, seed=0):
-        """Headline estimate: repeated stratified k-fold, mean ± std per metric.
-
-        Indexes only axis 0 of X, so it works for 2-D tabular matrices and 3-D
-        (n, channels, time) sequence tensors alike.
-        """
-        rkf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
-        rows = []
-        for tr, te in rkf.split(np.zeros(len(y)), y):
-            m = _fit(make_model, X[tr], y[tr])
-            proba = m.predict_proba(X[te]) if hasattr(m, "predict_proba") else None
-            # Derive the hard prediction from proba (argmax) so we are robust to
-            # each backend's predict() shape quirks (CatBoost MultiClass returns
-            # (n,1), XGBoost multi:softprob returns (n,k)); falls back to predict().
-            pred = proba.argmax(1) if proba is not None else np.asarray(m.predict(X[te])).ravel()
-            rows.append(evaluate(y[te], pred, proba, labels))
-        return {
-            k: (
-                float(np.mean([r[k] for r in rows])),
-                float(np.std([r[k] for r in rows])),
-            )
-            for k in rows[0]
-        }
-
-
-    def temporal_split(make_model, X, y, labels, order, train_frac=0.7):
-        """Generalization stress test: chronological early→late split.
-
-        Returns (metrics, train_dist, test_dist) so the imbalance is reported,
-        not hidden — class balance drifts across years (the salinization story).
-        """
-        idx = np.argsort(order)
-        cut = int(train_frac * len(idx))
-        tr, te = idx[:cut], idx[cut:]
-        m = _fit(make_model, X[tr], y[tr])
-        proba = m.predict_proba(X[te]) if hasattr(m, "predict_proba") else None
-        pred = proba.argmax(1) if proba is not None else np.asarray(m.predict(X[te])).ravel()
-        metrics = evaluate(y[te], pred, proba, labels)
-        return metrics, np.bincount(y[tr]).tolist(), np.bincount(y[te]).tolist()
-
-    return repeated_stratified_cv, temporal_split
-
-
-@app.function
-def fmt_stat(stat):
-    """Format a (mean, std) tuple, or a bare float, as a string."""
-    if isinstance(stat, tuple):
-        m, s = stat
-        return f"{m:.3f} ± {s:.3f}"
-    return f"{stat:.3f}"
+    return (
+        X,
+        class_names,
+        groups,
+        model_results,
+        model_results_moment,
+        train,
+        y,
+    )
 
 
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Track A — Gradient-boosting baseline (engineered features)
+    ## Two routes to Challenge 1 — excursion units vs expert moments
 
-    Models: **[XGBoost](https://arxiv.org/abs/1603.02754)** (primary),
-    **[CatBoost](https://arxiv.org/abs/1706.09516)** (strong on small data), and an
-    **[L2 logistic-regression](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html)**
-    floor. All use balanced class weighting; tree depths are kept shallow against the
-    tiny *n*. ([TabPFN](https://www.nature.com/articles/s41586-024-08328-6) slots in
-    once `TABPFN_TOKEN` is set.)
+    The same **hot-moment vs oxic-pulse** target is learned two ways, differing only in
+    *what an event is* (both share the CV harness, feature builders, and model heads in
+    `training.py`; pick with `--mode`):
+
+    | | **excursion** (`--mode excursion`) | **moment** (`--mode moment`) |
+    |---|---|---|
+    | **event** | auto-detected DO excursion ("unit") | expert-annotated moment window |
+    | **label** | inherited from the enclosing expert umbrella | the moment's own hot/oxic tag |
+    | **features** | 24 `FEATURE_COLS` | 22 `MOMENT_FEATURE_COLS` (hysteresis dropped — degenerate on one tight pulse) |
+    | **`mixed` holdout** | yes (`hx`/`b` held out) | none — every moment is directly typed |
+    | **artifact** | `model_results.parquet` | `model_results_moment.parquet` |
+
+    The excursion route sidesteps segmentation (detect-then-inherit); the moment route
+    is the literal Challenge-1 ask on the expert windows. Below, the two routes are
+    compared head-to-head on the headline grouped-CV tables; the **detailed
+    explainability that follows** (SHAP, mixed-event holdout, Track-B ROCKET readout)
+    is shown for the **excursion** route — the moment route mirrors the identical
+    pipeline.
     """)
     return
 
 
 @app.cell
-def _(class_names):
-    def _xgb():
-        return xgb.XGBClassifier(
-            n_estimators=300,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.8,
-            reg_lambda=2.0,
-            reg_alpha=0.5,
-            objective="multi:softprob",
-            num_class=len(class_names),
-            n_jobs=2,
-            verbosity=0,
-        )
+def metrics_routes_plot(
+    metric_bars_routes,
+    model_results,
+    model_results_moment,
+    train,
+):
+    _frames = {"excursion": model_results}
+    if model_results_moment is not None:
+        _frames["moment"] = model_results_moment
 
+    _n_exc = f"{train.height} units / {train['group_id'].n_unique()} umbrellas"
+    _mp = pl.read_parquet("derived/moment_features.parquet").filter(
+        pl.col("split") == "train"
+    )
+    _n_mom = f"{_mp.height} moments / {_mp['group_id'].n_unique()} umbrellas"
 
-    def _cat():
-        return CatBoostClassifier(
-            iterations=300,
-            depth=4,
-            learning_rate=0.05,
-            l2_leaf_reg=3.0,
-            loss_function="MultiClass",
-            auto_class_weights="Balanced",
-            verbose=False,
-            allow_writing_files=False,
-            thread_count=2,
-        )
-
-
-    def _logreg():
-        return make_pipeline(
-            SimpleImputer(strategy="median"),
-            StandardScaler(),
-            LogisticRegression(class_weight="balanced", max_iter=2000, C=0.5),
-        )
-
-
-    models = {"XGBoost": _xgb, "CatBoost": _cat, "Logistic (L2)": _logreg}
-    return (models,)
-
-
-@app.cell
-def _(X, class_labels, models, repeated_stratified_cv, y):
-    cv_results = {name: repeated_stratified_cv(mk, X, y, class_labels) for name, mk in models.items()}
-    _metrics = list(next(iter(cv_results.values())).keys())
-    cv_table = pl.DataFrame(
-        [{"model": name, **{k: fmt_stat(res[k]) for k in _metrics}} for name, res in cv_results.items()]
+    _note = (
+        "> ⚠️ **Moment route not yet computed** — run `.venv/bin/python training.py "
+        "--mode moment` to write `derived/model_results_moment.parquet`; only the "
+        "excursion route shows until then.\n\n"
+        if model_results_moment is None
+        else ""
     )
     mo.vstack(
         [
-            mo.md(
-                "**Repeated stratified 5×5 CV** (headline estimate, mean ± std). "
-                "High scores reflect the pseudo-label circularity, not real accuracy."
+            # mo.md(
+            #    _note + f"**Trainable events:** excursion = {_n_exc}; moment = {_n_mom}. "
+            #    "Both use StratifiedGroupKFold on the umbrella `group_id`, so the moment route "
+            #    "(more, tighter events) and the excursion route (fewer, wider windows) are "
+            #    "graded on the same leakage-safe basis. Bars bunch the two routes per model; "
+            #    "metric = tabs, whiskers = ±std across the 25 grouped-CV folds."
+            # ),
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.md(
+                                "**Engineered features, grouped 5×5 (excursion vs moment):**"
+                            ),
+                            metric_bars_routes(_frames, "base_grouped"),
+                        ]
+                    ),
+                    mo.vstack(
+                        [
+                            mo.md(
+                                "**ROCKET / InceptionTime on raw curves (excursion vs moment):**"
+                            ),
+                            metric_bars_routes(_frames, "dl_grouped"),
+                        ],
+                        # justify="space-around",
+                    ),
+                ],
+                justify="start",
             ),
-            mo.ui.table(cv_table, selection=None),
-        ]
-    )
-    return (cv_results,)
-
-
-@app.cell
-def _(X, class_labels, class_names, events, models, temporal_split, y):
-    _order = events["start"].to_numpy()
-    _rows = []
-    _dists = None
-    for _name, _mk in models.items():
-        _m, _td, _te = temporal_split(_mk, X, y, class_labels, _order)
-        _rows.append({"model": _name, **{k: f"{v:.3f}" for k, v in _m.items()}})
-        _dists = (_td, _te)
-    temporal_table = pl.DataFrame(_rows)
-    mo.vstack(
-        [
-            mo.md(
-                f"""
-                **Chronological early→late split** (70/30 by event start — stress test).
-                Train class counts = {_dists[0]}, test = {_dists[1]} over
-                classes {class_names}. The drift in balance is itself a finding:
-                class prevalence shifts across years (the salinization story), so a
-                pure temporal split can leave a class nearly absent on one side.
-                """
-            ),
-            mo.ui.table(temporal_table, selection=None),
         ]
     )
     return
 
 
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Track A — Gradient-boosting + linear baselines (engineered features)
+
+    **[XGBoost](https://arxiv.org/abs/1603.02754)** and
+    **[CatBoost](https://arxiv.org/abs/1706.09516)** (both strong on small tabular
+    data), with an **[L2 logistic-regression](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html)**
+    floor. Balanced class weighting throughout; shallow trees against the tiny *n*.
+    ([TabPFN](https://www.nature.com/articles/s41586-024-08328-6) slots in if its
+    one-time license is accepted / `TABPFN_TOKEN` is set.)
+    """)
+    return
+
+
 @app.cell
-def _(X, class_names, feature_cols, y):
-    # SHAP TreeExplainer importances on a full-data XGBoost fit. We expect the
-    # salinity-/water-level-step and precip drivers to rank highly (corroborates
-    # the EDA driver-association finding).
-    _m = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.8,
-        reg_lambda=2.0,
-        reg_alpha=0.5,
-        objective="multi:softprob",
-        num_class=len(class_names),
-        n_jobs=2,
-        verbosity=0,
+def metrics_grouped_plot(metric_bars_grouped, model_results):
+    mo.vstack(
+        [
+            mo.md(
+                "**Track A & B Validation Protocols.** Each model's bunched bars compare the main 5x5 grouped CV against "
+                "temporal splits, LOGO, and rigorous shuffling controls. "
+                "Metric = tabs; whiskers = ±std across the 25 grouped-CV folds."
+            ),
+            mo.hstack(
+                [
+                    mo.vstack(
+                        [
+                            mo.md(
+                                "**Track A (Engineered Features)**: Grouped vs Temporal/LOGO/Label-shuffled"
+                            ),
+                            metric_bars_grouped(
+                                model_results,
+                                {
+                                    "Grouped CV": "base_grouped",
+                                    "LOGO": "base_logo",
+                                    "Temporal": "base_temporal",
+                                    "Label-shuffled": "base_label_shuffled",
+                                },
+                            ),
+                        ]
+                    ),
+                    mo.vstack(
+                        [
+                            mo.md(
+                                "**Track B (Raw Curves)**: Grouped vs Wide/Label-shuffled/Time-shuffled"
+                            ),
+                            metric_bars_grouped(
+                                model_results,
+                                {
+                                    "Grouped CV": "dl_grouped",
+                                    "Wide 48h": "dl_wide_grouped",
+                                    "Label-shuffled": "dl_label_shuffled",
+                                    "Time-shuffled": "dl_time_shuffled",
+                                },
+                            ),
+                        ]
+                    ),
+                ]
+            ),
+        ]
     )
-    _m.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
-    _sv = np.array(shap.TreeExplainer(_m).shap_values(X))
-    # normalize to mean|SHAP| per feature regardless of (n,feat,k)/(k,n,feat) layout
-    if _sv.ndim == 3 and _sv.shape[-1] == len(class_names):
-        _imp = np.abs(_sv).mean(axis=(0, 2))
-    elif _sv.ndim == 3:
-        _imp = np.abs(_sv).mean(axis=(0, 1))
-    else:
-        _imp = np.abs(_sv).mean(axis=0)
+    return
 
-    shap_importance = pl.DataFrame({"feature": feature_cols, "mean_abs_shap": _imp}).sort(
-        "mean_abs_shap", descending=True
-    )
 
-    _chart = (
-        alt.Chart(shap_importance.head(15))
+@app.function
+def tabular_shap_charts(sv, X, feature_cols, class_names, topk=12):
+    """Shared bar + beeswarm renderer for a tabular SHAP matrix `sv` (n_rows ×
+    n_features, class-1 direction). Mirrors `shap_feature_panel`'s charts so the
+    logistic / TabPFN panels below read side-by-side with the XGBoost one."""
+    Xa = np.asarray(X, dtype=float)
+    cols = list(feature_cols)
+    imp = pl.DataFrame(
+        {
+            "feature": cols,
+            "mean_abs_shap": np.abs(sv).mean(axis=0).astype(float),
+        }
+    ).sort("mean_abs_shap", descending=True)
+    top = imp["feature"].to_list()[:topk]
+
+    rng = np.random.RandomState(0)
+    bee_rows = []
+    for f in top:
+        j = cols.index(f)
+        col = Xa[:, j].astype(float)
+        lo, hi = np.nanmin(col), np.nanmax(col)
+        norm = (col - lo) / (hi - lo) if hi > lo else np.full_like(col, 0.5)
+        for i in range(len(col)):
+            bee_rows.append(
+                {
+                    "feature": f,
+                    "shap": float(sv[i, j]),
+                    "feat_norm": None if np.isnan(norm[i]) else float(norm[i]),
+                    "value": None if np.isnan(col[i]) else float(col[i]),
+                    "jitter": float(rng.uniform(-0.35, 0.35)),
+                }
+            )
+    bee_df = pl.DataFrame(bee_rows)
+
+    bar = (
+        alt.Chart(imp.head(topk))
         .mark_bar(color="#4575b4")
         .encode(
             alt.X("mean_abs_shap:Q", title="mean |SHAP|"),
-            alt.Y("feature:N", sort="-x", title=None),
+            alt.Y("feature:N", sort=top, title=None),
             tooltip=["feature:N", alt.Tooltip("mean_abs_shap:Q", format=".3f")],
         )
-        .properties(width=460, height=380, title="XGBoost feature importance (SHAP)")
+        .properties(width=300, height=430, title="Global importance — mean |SHAP|")
     )
-    mo.vstack(
-        [
-            mo.md("**Which features drive the split** (mean |SHAP|, top 15):"),
-            _chart,
-        ]
-    )
-    return
-
-
-@app.cell
-def _(X, class_labels, repeated_stratified_cv, y):
-    # TabPFN v2 — zero-tuning in-context-learning sanity check (n < 1000). It needs
-    # a one-time Prior Labs license: set TABPFN_TOKEN in the environment to enable.
-    # Without it we skip gracefully rather than block the notebook.
-    if os.environ.get("TABPFN_TOKEN"):
-        from tabpfn import TabPFNClassifier
-
-        def _tabpfn():
-            return make_pipeline(
-                SimpleImputer(strategy="median"),
-                TabPFNClassifier(
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    ignore_pretraining_limits=True,
-                ),
-            )
-
-        tabpfn_cv = repeated_stratified_cv(_tabpfn, X, y, class_labels, n_repeats=2)
-        _out = mo.vstack(
-            [
-                mo.md("**TabPFN v2** (repeated stratified CV, 5×2):"),
-                mo.ui.table(
-                    pl.DataFrame(
-                        [{"model": "TabPFN", **{k: fmt_stat(v) for k, v in tabpfn_cv.items()}}]
-                    ),
-                    selection=None,
-                ),
-            ]
-        )
-    else:
-        tabpfn_cv = None
-        _out = mo.md(
-            "ℹ️ **TabPFN skipped** — set `TABPFN_TOKEN` (one-time Prior Labs license "
-            "at <https://ux.priorlabs.ai>) to enable the zero-tuning ICL sanity check."
-        )
-    _out
-    return (tabpfn_cv,)
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## Track B — Deep learning (raw event sequences)
-
-    Each event's multivariate 5-min series is resampled to a fixed length on a
-    normalized-time grid. Models, in priority order:
-
-    - **[B1 ROCKET](https://arxiv.org/abs/1910.13051) → logistic** *(primary)* —
-      random convolutional kernels, the small-data sweet spot; no GPU needed.
-    - **B2 Self-supervised contrastive pretrain + linear probe** — a conv encoder
-      trained label-free ([NT-Xent](https://arxiv.org/abs/2002.05709),
-      [TS2Vec](https://arxiv.org/abs/2106.10466)) on the event windows, then a linear head.
-    - **[B3 InceptionTime](https://arxiv.org/abs/1909.04939) + [focal loss](https://arxiv.org/abs/1708.02002)**
-      *(comparison)* — expected to hit the small-*n* overfitting ceiling.
-    - **B4 [Patch-transformer](https://arxiv.org/abs/2211.14730)** *(stretch)* — the
-      most data-hungry option ([attention](https://arxiv.org/abs/1706.03762)).
-    """)
-    return
-
-
-@app.cell
-def _(event_samples, events):
-    # Resample every event's channels onto a fixed-length normalized-time grid →
-    # (n_events, n_channels, SEQ_LEN) tensor aligned to events row order.
-    CHANNELS = [
-        "Dissolved Oxygen (mg/L)",
-        "DO Sensor Temperature (C) ",
-        "Well Salinity (PPT)",
-        "Flood plain water level in BGS (cm)",
-        "Precip (mm) over 5 minutes",
-        "AirT_C_Avg",
-        "SlrFD_kW_Avg",
-    ]
-    SEQ_LEN = 128
-
-
-    def build_event_tensor(events, samples, channels, seq_len):
-        grid = np.linspace(0.0, 1.0, seq_len)
-        by = {k[0]: v for k, v in samples.partition_by("eid", as_dict=True).items()}
-        out = np.zeros((events.height, len(channels), seq_len), dtype=np.float32)
-        for i, e in enumerate(events["eid"].to_list()):
-            d = by[e].sort("elapsed_min")
-            t = d["elapsed_min"].to_numpy().astype(float)
-            tn = (t - t.min()) / (t.max() - t.min()) if t.max() > t.min() else np.zeros_like(t)
-            for c, ch in enumerate(channels):
-                v = d[ch].to_numpy().astype(float)
-                mask = ~np.isnan(v)
-                if mask.sum():
-                    out[i, c] = np.interp(grid, tn[mask], v[mask])
-        return out
-
-
-    X3d = build_event_tensor(events, event_samples, CHANNELS, SEQ_LEN)
-    mo.md(
-        f"**Sequence tensor:** {X3d.shape[0]} events × {X3d.shape[1]} channels × "
-        f"{X3d.shape[2]} timesteps (resampled on normalized time)."
-    )
-    return CHANNELS, SEQ_LEN, X3d
-
-
-@app.cell
-def _(SEQ_LEN):
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-    def set_torch_seed(seed):
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-
-
-    def focal_loss(logits, target, weight, gamma=2.0):
-        logp = F.log_softmax(logits, 1)
-        ce = F.nll_loss(logp, target, weight=weight, reduction="none")
-        pt = logp.exp().gather(1, target[:, None]).squeeze(1)
-        return ((1 - pt) ** gamma * ce).mean()
-
-
-    class InceptionBlock(nn.Module):
-        def __init__(self, cin, nf=24):
-            super().__init__()
-            self.bottle = nn.Conv1d(cin, nf, 1, padding="same", bias=False)
-            self.convs = nn.ModuleList(
-                [nn.Conv1d(nf, nf, k, padding="same", bias=False) for k in (9, 19, 39)]
-            )
-            self.mp = nn.MaxPool1d(3, 1, padding=1)
-            self.cmp = nn.Conv1d(cin, nf, 1, padding="same", bias=False)
-            self.bn = nn.BatchNorm1d(nf * 4)
-            self.act = nn.ReLU()
-
-        def forward(self, x):
-            b = self.bottle(x)
-            outs = [c(b) for c in self.convs] + [self.cmp(self.mp(x))]
-            return self.act(self.bn(torch.cat(outs, 1)))
-
-
-    class InceptionTime(nn.Module):
-        def __init__(self, cin, nclass, nf=24, depth=3):
-            super().__init__()
-            self.blocks = nn.ModuleList()
-            ch = cin
-            for _ in range(depth):
-                self.blocks.append(InceptionBlock(ch, nf))
-                ch = nf * 4
-            self.gap = nn.AdaptiveAvgPool1d(1)
-            self.fc = nn.Linear(ch, nclass)
-
-        def forward(self, x):
-            for b in self.blocks:
-                x = b(x)
-            return self.fc(self.gap(x).squeeze(-1))
-
-
-    class PatchTransformer(nn.Module):
-        def __init__(self, cin, nclass, d_model=64, nhead=4, depth=2, patch=8):
-            super().__init__()
-            self.embed = nn.Conv1d(cin, d_model, patch, stride=patch)
-            n_tok = SEQ_LEN // patch
-            self.pos = nn.Parameter(torch.randn(1, n_tok, d_model) * 0.02)
-            enc = nn.TransformerEncoderLayer(
-                d_model,
-                nhead,
-                dim_feedforward=d_model * 2,
-                dropout=0.1,
-                batch_first=True,
-                activation="gelu",
-            )
-            self.tr = nn.TransformerEncoder(enc, depth)
-            self.fc = nn.Linear(d_model, nclass)
-
-        def forward(self, x):
-            z = self.embed(x).transpose(1, 2) + self.pos
-            return self.fc(self.tr(z).mean(1))
-
-
-    class ConvEncoder(nn.Module):
-        """Dilated-conv encoder for the self-supervised track."""
-
-        def __init__(self, cin, emb=64):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv1d(cin, 64, 7, padding=3),
-                nn.ReLU(),
-                nn.Conv1d(64, 64, 7, padding=6, dilation=2),
-                nn.ReLU(),
-                nn.Conv1d(64, emb, 7, padding=12, dilation=4),
-                nn.ReLU(),
-            )
-            self.gap = nn.AdaptiveAvgPool1d(1)
-
-        def forward(self, x):
-            return self.gap(self.net(x)).squeeze(-1)
-
-
-    class TorchSeqClassifier:
-        """sklearn-style wrapper so torch sequence models reuse the CV harness.
-
-        Standardizes channels on the training fold, trains with focal loss and
-        balanced class weights, exposes predict / predict_proba.
-        """
-
-        def __init__(
-            self, build_fn, n_classes, epochs=140, lr=1e-3, wd=1e-3, jitter=0.05, gamma=2.0, seed=0
-        ):
-            self.build_fn = build_fn
-            self.n_classes = n_classes
-            self.epochs, self.lr, self.wd = epochs, lr, wd
-            self.jitter, self.gamma, self.seed = jitter, gamma, seed
-
-        def fit(self, X, y, sample_weight=None):
-            set_torch_seed(self.seed)
-            self.mu_ = X.mean((0, 2), keepdims=True)
-            self.sd_ = X.std((0, 2), keepdims=True) + 1e-6
-            Xs = (X - self.mu_) / self.sd_
-            cw = compute_class_weight("balanced", classes=np.arange(self.n_classes), y=y)
-            cw = torch.tensor(cw, dtype=torch.float32, device=DEVICE)
-            self.net_ = self.build_fn(X.shape[1], self.n_classes).to(DEVICE)
-            opt = torch.optim.AdamW(self.net_.parameters(), lr=self.lr, weight_decay=self.wd)
-            xt = torch.tensor(Xs, dtype=torch.float32, device=DEVICE)
-            yt = torch.tensor(y, dtype=torch.long, device=DEVICE)
-            self.net_.train()
-            for _ in range(self.epochs):
-                xb = xt + self.jitter * torch.randn_like(xt)
-                opt.zero_grad()
-                focal_loss(self.net_(xb), yt, cw, self.gamma).backward()
-                opt.step()
-            return self
-
-        def predict_proba(self, X):
-            Xs = (X - self.mu_) / self.sd_
-            self.net_.eval()
-            with torch.no_grad():
-                logits = self.net_(torch.tensor(Xs, dtype=torch.float32, device=DEVICE))
-                return F.softmax(logits, 1).cpu().numpy()
-
-        def predict(self, X):
-            return self.predict_proba(X).argmax(1)
-
-
-    def nt_xent(z1, z2, temp=0.2):
-        z1, z2 = F.normalize(z1, dim=1), F.normalize(z2, dim=1)
-        z = torch.cat([z1, z2], 0)
-        n = z1.shape[0]
-        sim = z @ z.t() / temp
-        sim.fill_diagonal_(-1e9)
-        targets = torch.arange(n, device=z.device)
-        targets = torch.cat([targets + n, targets])
-        return F.cross_entropy(sim, targets)
-
-    return (
-        ConvEncoder,
-        DEVICE,
-        InceptionTime,
-        PatchTransformer,
-        TorchSeqClassifier,
-        nt_xent,
-        set_torch_seed,
-    )
-
-
-@app.cell
-def _(CHANNELS, X3d, class_labels, repeated_stratified_cv, y):
-    # B1 — ROCKET (multivariate, hand-rolled): random dilated conv kernels with
-    # PPV + max pooling, then a balanced logistic head. Kernels are data- and
-    # label-independent, so transforming all events up front is leakage-free; only
-    # the scaler + classifier are refit per fold.
-    def _rocket_kernels(n_channels, seq_len, n_kernels=1000, seed=0):
-        rng = np.random.default_rng(seed)
-        ks = []
-        for _ in range(n_kernels):
-            klen = int(rng.choice([7, 9, 11]))
-            w = rng.standard_normal((n_channels, klen)).astype(np.float32)
-            w -= w.mean(axis=1, keepdims=True)
-            nch = rng.integers(1, n_channels + 1)
-            chans = rng.choice(n_channels, size=nch, replace=False)
-            a = int(np.log2((seq_len - 1) / (klen - 1))) if seq_len > klen else 0
-            dil = int(2 ** rng.uniform(0, max(a, 0)))
-            bias = float(rng.uniform(-1, 1))
-            pad = ((klen - 1) * dil) // 2 if rng.random() < 0.5 else 0
-            ks.append((w, chans, dil, bias, pad))
-        return ks
-
-
-    def _rocket_transform(X3d, kernels):
-        n = X3d.shape[0]
-        feats = np.zeros((n, 2 * len(kernels)), dtype=np.float32)
-        for j, (w, chans, dil, bias, pad) in enumerate(kernels):
-            klen = w.shape[1]
-            Xp = np.pad(X3d[:, chans, :], ((0, 0), (0, 0), (pad, pad))) if pad else X3d[:, chans, :]
-            span = (klen - 1) * dil + 1
-            if Xp.shape[2] < span:
-                continue
-            nout = Xp.shape[2] - span + 1
-            acc = np.full((n, nout), bias, dtype=np.float32)
-            for ci_, _ch in enumerate(chans):
-                wc = w[_ch]
-                for k in range(klen):
-                    acc += wc[k] * Xp[:, ci_, k * dil : k * dil + nout]
-            feats[:, 2 * j] = (acc > 0).mean(axis=1)
-            feats[:, 2 * j + 1] = acc.max(axis=1)
-        return feats
-
-
-    rocket_features = _rocket_transform(
-        X3d, _rocket_kernels(len(CHANNELS), X3d.shape[2], n_kernels=1000, seed=0)
-    )
-
-
-    def _rocket_clf():
-        return make_pipeline(
-            StandardScaler(),
-            LogisticRegression(class_weight="balanced", max_iter=2000, C=1.0),
-        )
-
-
-    rocket_cv = repeated_stratified_cv(_rocket_clf, rocket_features, y, class_labels)
-    mo.vstack(
-        [
-            mo.md(
-                f"**B1 ROCKET → logistic** ({rocket_features.shape[1]} random features, "
-                "5×5 CV). Learns from raw shape — less circular than Track A:"
+    bee = (
+        alt.Chart(bee_df)
+        .mark_circle(size=26, opacity=0.65)
+        .encode(
+            x=alt.X(
+                "shap:Q",
+                title=f"SHAP value  (◀ {class_names[0]} · {class_names[1]} ▶)",
             ),
-            mo.ui.table(
-                pl.DataFrame(
-                    [{"model": "B1 ROCKET", **{k: fmt_stat(v) for k, v in rocket_cv.items()}}]
-                ),
-                selection=None,
+            y=alt.Y("feature:N", sort=top, title=None),
+            yOffset="jitter:Q",
+            color=alt.Color(
+                "feat_norm:Q",
+                scale=alt.Scale(scheme="redblue", reverse=True),
+                title="feature value (low → high)",
+                legend=alt.Legend(orient="bottom"),
             ),
-        ]
-    )
-    return (rocket_cv,)
-
-
-@app.cell
-def _(
-    ConvEncoder,
-    DEVICE,
-    X3d,
-    class_labels,
-    nt_xent,
-    repeated_stratified_cv,
-    set_torch_seed,
-    y,
-):
-    # B2 — Self-supervised contrastive pretrain (label-free) + linear probe. The
-    # encoder is trained once on ALL event windows with two jittered/scaled views
-    # per event (NT-Xent); embeddings are then probed per fold. Pretraining never
-    # sees labels, so embedding all events up front is leakage-free. (Scaling this
-    # to sliding windows over the full 553k-row series is the documented next step.)
-    def _train_ssl(X3d, epochs=300, emb=64, seed=0):
-        set_torch_seed(seed)
-        mu = X3d.mean((0, 2), keepdims=True)
-        sd = X3d.std((0, 2), keepdims=True) + 1e-6
-        xt = torch.tensor((X3d - mu) / sd, dtype=torch.float32, device=DEVICE)
-        enc = ConvEncoder(X3d.shape[1], emb).to(DEVICE)
-        opt = torch.optim.AdamW(enc.parameters(), lr=1e-3, weight_decay=1e-4)
-        enc.train()
-        for _ in range(epochs):
-            v1 = xt + 0.1 * torch.randn_like(xt)
-            v2 = xt * (1 + 0.1 * torch.randn_like(xt))
-            opt.zero_grad()
-            nt_xent(enc(v1), enc(v2)).backward()
-            opt.step()
-        enc.eval()
-        with torch.no_grad():
-            return enc(xt).cpu().numpy()
-
-
-    ssl_embeddings = _train_ssl(X3d)
-
-
-    def _probe():
-        return make_pipeline(
-            StandardScaler(),
-            LogisticRegression(class_weight="balanced", max_iter=2000, C=1.0),
+            tooltip=[
+                "feature:N",
+                alt.Tooltip("value:Q", format=".3g"),
+                alt.Tooltip("shap:Q", format=".3f"),
+            ],
         )
-
-
-    ssl_cv = repeated_stratified_cv(_probe, ssl_embeddings, y, class_labels)
-    mo.vstack(
-        [
-            mo.md(
-                f"**B2 Self-supervised + linear probe** ({ssl_embeddings.shape[1]}-d "
-                "contrastive embedding, 5×5 CV):"
-            ),
-            mo.ui.table(
-                pl.DataFrame(
-                    [{"model": "B2 SSL+probe", **{k: fmt_stat(v) for k, v in ssl_cv.items()}}]
-                ),
-                selection=None,
-            ),
-        ]
+        .properties(width=440, height=430, title="Per-row SHAP — direction & magnitude")
     )
-    return (ssl_cv,)
-
-
-@app.cell
-def _(
-    InceptionTime,
-    TorchSeqClassifier,
-    X3d,
-    class_labels,
-    class_names,
-    repeated_stratified_cv,
-    y,
-):
-    # B3 — Supervised InceptionTime + focal loss. Expected to overfit at n~100;
-    # included to demonstrate the small-data DL ceiling. 5×2 CV to bound runtime.
-    def _make_inception():
-        return TorchSeqClassifier(
-            lambda cin, k: InceptionTime(cin, k),
-            n_classes=len(class_names),
-            epochs=140,
-        )
-
-
-    inception_cv = repeated_stratified_cv(_make_inception, X3d, y, class_labels, n_repeats=2)
-    mo.vstack(
-        [
-            mo.md("**B3 InceptionTime + focal loss** (5×2 CV):"),
-            mo.ui.table(
-                pl.DataFrame(
-                    [{"model": "B3 InceptionTime", **{k: fmt_stat(v) for k, v in inception_cv.items()}}]
-                ),
-                selection=None,
-            ),
-        ]
+    zero = (
+        alt.Chart(pl.DataFrame({"z": [0.0]}))
+        .mark_rule(color="#888", strokeDash=[4, 3])
+        .encode(x="z:Q")
     )
-    return (inception_cv,)
+    return mo.hstack([bar, bee + zero], justify="start")
 
 
-@app.cell
-def _(
-    PatchTransformer,
-    TorchSeqClassifier,
-    X3d,
-    class_labels,
-    class_names,
-    repeated_stratified_cv,
-    y,
-):
-    # B4 — Patch-transformer (stretch). Most data-hungry; here mainly to show the
-    # ceiling holds for attention models too at this n. 5×2 CV.
-    def _make_transformer():
-        return TorchSeqClassifier(
-            lambda cin, k: PatchTransformer(cin, k),
-            n_classes=len(class_names),
-            epochs=160,
-        )
+@app.function
+@mo.persistent_cache
+def logistic_shap_panel(X, y, class_names, feature_cols, topk=12):
+    """Exact SHAP for the torch logistic head via `shap.LinearExplainer`. The skorch net
+    is linear, so in standardized-feature space the class-1 log-odds is
+    (w₁−w₀)·x+(b₁−b₀) and LinearExplainer attributes it per feature. Balanced loss is
+    internal to the net (no sample_weight); read against the XGBoost panel for the
+    additive-only view."""
+    pipe = logreg_fn()
+    pipe.fit(X, np.asarray(y))
+    Xs = pipe[:-1].transform(X)  # median-impute → z-score → float32 (what the net sees)
+    _lin = pipe[-1].module_.linear
+    _W = _lin.weight.detach().cpu().numpy()
+    _b = _lin.bias.detach().cpu().numpy()
+    coef = (_W[1] - _W[0]).astype(float)
+    intercept = float(_b[1] - _b[0])
+    sv = np.asarray(shap.LinearExplainer((coef, intercept), Xs).shap_values(Xs))
+    return tabular_shap_charts(sv, X, feature_cols, class_names, topk)
 
 
-    transformer_cv = repeated_stratified_cv(_make_transformer, X3d, y, class_labels, n_repeats=2)
-    mo.vstack(
-        [
-            mo.md("**B4 Patch-transformer** (5×2 CV):"),
-            mo.ui.table(
-                pl.DataFrame(
-                    [{"model": "B4 Transformer", **{k: fmt_stat(v) for k, v in transformer_cv.items()}}]
-                ),
-                selection=None,
-            ),
-        ]
+@app.function
+@mo.persistent_cache
+def tabpfn_shap_panel(X, y, class_names, feature_cols, topk=12, budget=128):
+    """SHAP for TabPFN v3 via its **own imputation explainer**
+    (`tabpfn_extensions.interpretability.shapiq.get_tabpfn_imputation_explainer` —
+    shapiq under the hood, imputation-based feature removal) bridged to a
+    `shap.Explanation`. TabPFN is a transformer, not a tree, so TreeExplainer can't
+    touch it; `fit_with_cache` + `balance_probabilities` mirror the modelled config,
+    `class_index=1` explains the push toward `class_names[1]`. Slowest explainer cell."""
+    Xi = SimpleImputer(strategy="median").fit_transform(np.asarray(X, dtype=float))
+    clf = TabPFNClassifier(
+        fit_mode="fit_with_cache",
+        ignore_pretraining_limits=True,
+        balance_probabilities=True,
+        random_state=0,
     )
-    return (transformer_cv,)
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## M-final — Comparison & synthesis
-    """)
-    return
-
-
-@app.cell
-def _(cv_results, inception_cv, rocket_cv, ssl_cv, tabpfn_cv, transformer_cv):
-    # One table, every model on the same repeated-stratified-CV protocol & metrics.
-    _entries = []
-    for _name, _res in cv_results.items():
-        _entries.append(("A · engineered", _name, _res))
-    if tabpfn_cv is not None:
-        _entries.append(("A · engineered", "TabPFN", tabpfn_cv))
-    _entries += [
-        ("B · raw seq", "B1 ROCKET", rocket_cv),
-        ("B · raw seq", "B2 SSL+probe", ssl_cv),
-        ("B · raw seq", "B3 InceptionTime", inception_cv),
-        ("B · raw seq", "B4 Transformer", transformer_cv),
-    ]
-    _metrics = list(rocket_cv.keys())
-    results_all = pl.DataFrame(
-        [
-            {"track": _t, "model": _n, **{k: fmt_stat(_r[k]) for k in _metrics}}
-            for _t, _n, _r in _entries
-        ]
+    clf.fit(Xi, np.asarray(y))
+    expl = get_tabpfn_imputation_explainer(
+        model=clf, data=Xi, index="SV", max_order=1, class_index=1
     )
-    # numeric macro-F1 for ranking
-    results_all = results_all.with_columns(
-        pl.Series("macro_f1_num", [_r["macro_f1"][0] for _, _, _r in _entries])
-    ).sort("macro_f1_num", descending=True)
-    mo.vstack(
-        [
-            mo.md("**All models, repeated-stratified CV (mean ± std), ranked by macro-F1:**"),
-            mo.ui.table(results_all.drop("macro_f1_num"), selection=None),
-        ]
+    se = shapiq_to_shap_explanation(
+        expl, Xi, budget=budget, feature_names=list(feature_cols)
     )
-    return
+    return tabular_shap_charts(
+        np.asarray(se.values), Xi, feature_cols, class_names, topk
+    )
 
 
 @app.cell(hide_code=True)
@@ -885,23 +851,17 @@ def _():
     mo.md(r"""
     ### Synthesis & honest caveats
 
-    - **Circularity (Track A).** The `cluster` target was derived *from* the
-      engineered features, so boosting on those same features is the most
-      circular setup — strong scores here mostly validate the pipeline. Track B
-      (raw sequences) is a different representation and a fairer, if still
-      pseudo-labelled, test.
-    - **Tiny-*n* ceiling (Track B).** With ~100 events the supervised deep nets
-      (InceptionTime, transformer) sit below ROCKET and the boosted baselines —
-      the expected small-data ceiling. ROCKET (fixed random kernels) and the
-      self-supervised probe are the right tools at this scale.
-    - **Temporal imbalance.** The early→late split leaves one class nearly
-      absent in the late period — class prevalence genuinely drifts across years
-      (the salinization story). Treat that as a finding, not just a split issue.
-    - **No SMOTE.** At ~20 minority samples, balanced class weights / focal loss
-      are used instead of synthetic oversampling.
-    - **Drop-in real labels.** When the NDA expert labels arrive, add them to
-      `events.parquet`, set `LABEL_COL` to that column, and rerun — every model,
-      split, and metric above recomputes unchanged.
+    - **Grouped CV is the point.** Nested units from one expert umbrella share a
+      `group_id` and are kept on one side of every split, so scores are not inflated
+      by near-duplicate excursions leaking across folds — the flaw in a plain
+      stratified split at this granularity.
+    - **Tiny, imbalanced *n*.** Read **macro-F1 / balanced accuracy / MCC**, not
+      accuracy. LOGO agrees with the 5×5 grouped estimate as a variance check.
+    - **No SMOTE.** With so few minority units, balanced class weights are used, not
+      synthetic oversampling.
+    - **Track B.** Deep learning on the raw `proc_curves.parquet` (128×5) reuses this
+      grouped-CV harness (it indexes axis 0) — the honest test of whether O2 *shape* alone
+      recovers the class.
     """)
     return
 
@@ -909,30 +869,374 @@ def _():
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## References
+    ## M-mixed — Where do the held-out *mixed* events fall?
 
-    Citations for each model and method used above.
-
-    **Track A — gradient boosting & tabular**
-
-    - **XGBoost** — Chen & Guestrin (2016), *XGBoost: A Scalable Tree Boosting System*, KDD. <https://arxiv.org/abs/1603.02754>
-    - **CatBoost** — Prokhorenkova et al. (2018), *CatBoost: unbiased boosting with categorical features*, NeurIPS. <https://arxiv.org/abs/1706.09516>
-    - **Logistic regression (L2)** — scikit-learn `LogisticRegression`. <https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html>
-    - **TabPFN v2** — Hollmann et al. (2025), *Accurate predictions on small data with a tabular foundation model*, Nature. <https://www.nature.com/articles/s41586-024-08328-6> · orig. ICLR 2023: <https://arxiv.org/abs/2207.01848>
-
-    **Track B — time-series deep learning**
-
-    - **ROCKET** — Dempster, Petitjean & Webb (2020), *ROCKET: exceptionally fast and accurate time series classification using random convolutional kernels*, DMKD. <https://arxiv.org/abs/1910.13051> · **MiniRocket**: <https://arxiv.org/abs/2012.08791>
-    - **Self-supervised contrastive (B2)** — NT-Xent / SimCLR: Chen et al. (2020), *A Simple Framework for Contrastive Learning of Visual Representations*. <https://arxiv.org/abs/2002.05709> · time-series instantiation **TS2Vec**: Yue et al. (2022), AAAI. <https://arxiv.org/abs/2106.10466>
-    - **InceptionTime** — Ismail Fawaz et al. (2020), *InceptionTime: Finding AlexNet for Time Series Classification*, DMKD. <https://arxiv.org/abs/1909.04939>
-    - **Patch-transformer** — attention: Vaswani et al. (2017), *Attention Is All You Need*. <https://arxiv.org/abs/1706.03762> · patch-based TS transformer **PatchTST**: Nie et al. (2023), ICLR. <https://arxiv.org/abs/2211.14730>
-
-    **Shared methods**
-
-    - **Focal loss** (Track B class imbalance) — Lin et al. (2017), *Focal Loss for Dense Object Detection*, ICCV. <https://arxiv.org/abs/1708.02002>
-    - **SHAP** (Track A interpretability) — Lundberg & Lee (2017), *A Unified Approach to Interpreting Model Predictions*, NeurIPS. <https://arxiv.org/abs/1705.07874>
+    The challenge defines **three** event types (hot / oxic pulse / **mixed**), but with
+    only a handful of mixed umbrellas we model hot-vs-pulse and hold the **mixed (`hx`,
+    "unknown hot moment") + undefined `b`** events out (`split=="holdout"`). Rather than
+    force a third class we cannot learn at this *n*, we ask the binary classifier what it
+    *does* with them: a genuine mixed event — a pulse-shaped DO rise carrying a hot-like
+    **salinity step** — should land near the **hot/pulse decision boundary** (high
+    prediction entropy), not confidently in either camp. That turns the untrained class
+    into evidence that the binary boundary is meaningful.
     """)
     return
+
+
+@app.cell
+def _(X, class_names, groups, y):
+    _hold = (
+        pl.read_parquet("derived/proc_features.parquet")
+        .filter(pl.col("split") == "holdout")
+        .sort("group_id", "start")
+    )
+    _Xh = _hold.select(FEATURE_COLS).to_numpy().astype(float)
+
+    _clf = xgb_fn()
+    _clf.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
+    _ph = _clf.predict_proba(_Xh)[:, 1].astype(
+        float
+    )  # P(pulse) on the unseen held-out events
+
+    # Fair train baseline: out-of-fold P(pulse) from the same grouped CV (never in-sample).
+    _oof = np.full(len(y), np.nan)
+    _sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
+    for _tr, _te in _sgkf.split(np.zeros(len(y)), y, groups):
+        _m = xgb_fn()
+        _m.fit(X[_tr], y[_tr], sample_weight=compute_sample_weight("balanced", y[_tr]))
+        _oof[_te] = _m.predict_proba(X[_te])[:, 1]
+
+    def _entropy(p):
+        p = np.clip(p, 1e-9, 1 - 1e-9)
+        return -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
+
+    _Hh, _Ho = _entropy(_ph), _entropy(_oof)
+
+    # Per-event table for the held-out events (why they are ambiguous: pulse-like rise
+    # + a hot-like salinity step). sal_step / wl_step / rise_rate are the decisive features.
+    mixed_boundary = (
+        _hold.select(["group_id", "expert_subtype", "sal_step", "wl_step", "rise_rate"])
+        .with_columns(
+            p_pulse=pl.Series(_ph).round(3),
+            entropy_bits=pl.Series(_Hh).round(3),
+            prediction=pl.Series(np.where(_ph >= 0.5, class_names[1], class_names[0])),
+        )
+        .sort("entropy_bits", descending=True)
+    )
+
+    # Train (OOF) vs held-out entropy distributions
+    _dist = pl.concat(
+        [
+            pl.DataFrame({"entropy_bits": _Ho}).with_columns(
+                set=pl.lit("train (hot/pulse, OOF)")
+            ),
+            pl.DataFrame({"entropy_bits": _Hh}).with_columns(
+                set=pl.lit("held-out (mixed/boundary)")
+            ),
+        ]
+    )
+    _chart = (
+        alt.Chart(_dist)
+        .mark_tick(thickness=2, size=18, opacity=0.7)
+        .encode(
+            x=alt.X(
+                "entropy_bits:Q",
+                title="prediction entropy (bits) — 1.0 = on the boundary",
+                scale=alt.Scale(domain=[0, 1]),
+            ),
+            y=alt.Y("set:N", title=None),
+            color=alt.Color("set:N", legend=None),
+        )
+        .properties(
+            width=460,
+            height=110,
+            title="Mixed events cluster toward the hot/pulse boundary",
+        )
+    )
+
+    _frac_hi = float((_Hh > np.nanmedian(_Ho)).mean())
+    mo.vstack(
+        [
+            mo.md(
+                f"**Held-out mixed/boundary events vs the binary boundary.** Median "
+                f"entropy: **{np.nanmedian(_Ho):.2f} bits** (train, OOF) vs "
+                f"**{np.median(_Hh):.2f} bits** (held-out); **{_frac_hi:.0%}** of the "
+                f"{len(_Hh)} held-out events sit above the train median. With only "
+                f"{len(_Hh)} events this is illustrative, not a statistical test — but it "
+                f"shows mixed events land exactly where hot vs pulse is ambiguous, "
+                f"consistent with their definition (pulse-shaped rise + a hot-like "
+                f"salinity step)."
+            ),
+            _chart,
+            mo.ui.table(mixed_boundary, selection=None),
+        ]
+    )
+    return
+
+
+@app.cell
+def _():
+    mo.md(r"""
+    ## Track B — Deep learning on raw sequences
+
+    The honest test: can the raw 5-channel waveform (DO, salinity, water level,
+    temperature, precipitation — 128 steps × 5 channels) recover the hot-moment
+    vs oxic-pulse classification **without hand-crafted features**?
+
+    All heads run through the same grouped-CV harness (`training.py`, which indexes axis
+    0 so it handles 3-D tensors natively); the tables below are **loaded** from its
+    precomputed `derived/model_results.parquet`:
+
+    - **Real labels** — **ROCKET** (10,000 random convolutional kernels, Dempster et al.
+      2020) → XGBoost / CatBoost / Logistic / TabPFN, on the tight ±≤12 h window and a
+      wide 48 h-context variant, plus end-to-end **InceptionTime-lite** (focal loss).
+    - **Shuffled labels** and **shuffled time** — the identical pipelines with labels
+      permuted, or the time axis permuted; both leakage / order controls.
+    """)
+    return
+
+
+@app.cell
+def _(train):
+    _m2i = {uid: i for i, uid in enumerate(train["unit_id"].to_list())}
+    X_seq = read_time_series_curves("derived/proc_curves.parquet", _m2i)
+    rocket = RocketTransform(n_kernels=10000, seed=42).fit(X_seq)
+    X_rocket = rocket.transform(X_seq)
+    mo.md(
+        f"**ROCKET transform (torch/GPU · core.model):** 10,000 random kernels → "
+        f"{X_rocket.shape[1]:,} features from the train sequences "
+        f"(loaded here only to explain the precomputed Track-B result)."
+    )
+    return X_rocket, X_seq, rocket
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ### Track B synthesis
+
+    - **ROCKET** is a strong baseline: random convolutional kernels extract discriminative
+      features from the raw waveform without training, then a simple linear or tree-based
+      classifier separates the classes. This is the **fairer test** compared to Track A — no
+      hand-crafted features are used, and no gradient descent on the tiny training set is needed.
+    - **Wide 48 h context** adds ~+0.04 macro-F1 over the tight window, on the minority
+      **pulse** class — the pre-onset salinity/water-level trajectory that `sal_step`/`wl_step`
+      encode is genuinely informative.
+    - **InceptionTime-lite** trains end-to-end with focal loss to handle the class imbalance.
+      With only a few dozen training examples, deep CNNs struggle to converge and tend to
+      collapse to the majority class (~0.44 macro-F1).
+    - **ROCKET → TabPFN v3** is a *ceiling probe*: it chains the two strongest per-track
+      models — ROCKET features (compressed by fold-internal PCA) feeding TabPFN's in-context
+      tabular reasoner. It lands at the same ~0.80 wall, confirming the ceiling is a property
+      of the label signal at this small n, not of any one estimator.
+    - **Shuffled-label controls** collapse to chance, confirming no leakage in the sequence
+      pipeline (normalization, CV splits, model training).
+    - **Takeaway:** At this small sample size, hand-crafted features + gradient boosting (Track A)
+      or ROCKET (Track B) vastly outperform end-to-end deep learning — and no combination
+      of the best components breaks the ~0.80 macro-F1 ceiling.
+    """)
+    return
+
+
+@app.function
+@mo.persistent_cache
+def inception_shap_panel(X_seq, y, class_names, max_epochs=120):
+    """GradientSHAP (`shap.GradientExplainer`) on the end-to-end InceptionTime-lite net —
+    the DL-native explainer. Fits the pipeline, reaches the raw torch module, and
+    attributes the class-1 logit over the (channel × time) input. Attributions are
+    aggregated to per-channel reliance and a per-timestep temporal profile (the sequence
+    analogue of the ROCKET channel / dilation view), plus a per-row channel beeswarm.
+    Focal loss handles imbalance internally (no sample_weight)."""
+    channels = ["do", "sal", "wl", "temp", "precip"][: X_seq.shape[1]]
+    pipe = inception_fn(n_channels=X_seq.shape[1], max_epochs=max_epochs)
+    pipe.fit(X_seq, np.asarray(y))
+    Xsq = pipe[0].transform(X_seq).astype(np.float32)  # channel z-norm, NaN-scrubbed
+    module = pipe[-1].module_.eval()
+    dev = next(module.parameters()).device
+    rng = np.random.RandomState(0)
+    _bg = torch.tensor(
+        Xsq[rng.choice(len(Xsq), size=min(50, len(Xsq)), replace=False)], device=dev
+    )
+    _sv = shap.GradientExplainer(module, _bg).shap_values(
+        torch.tensor(Xsq, device=dev), nsamples=100
+    )
+    sv = (
+        _sv[1] if isinstance(_sv, list) else np.asarray(_sv)[..., 1]
+    )  # class 1 → (N,C,T)
+    sv = np.asarray(sv)
+
+    # 1) channel reliance — Σ over time of mean|SHAP| per channel.
+    by_ch = pl.DataFrame(
+        {
+            "channel": channels,
+            "shap": np.abs(sv).mean(axis=0).sum(axis=1).astype(float),
+        }
+    ).sort("shap", descending=True)
+    chart_ch = (
+        alt.Chart(by_ch)
+        .mark_bar()
+        .encode(
+            alt.X("channel:N", sort="-y", title="Channel"),
+            alt.Y("shap:Q", title="Σ mean|SHAP|"),
+            color=alt.Color("channel:N", legend=None),
+            tooltip=["channel", alt.Tooltip("shap:Q", format=".3f")],
+        )
+        .properties(width=300, height=250, title="Channel reliance (Σ mean|SHAP|)")
+    )
+
+    # 2) temporal profile — mean|SHAP| per timestep, per channel.
+    _prof = np.abs(sv).mean(axis=0)  # (C, T)
+    _prof_rows = [
+        {"step": int(t), "channel": channels[c], "shap": float(_prof[c, t])}
+        for c in range(_prof.shape[0])
+        for t in range(_prof.shape[1])
+    ]
+    chart_time = (
+        alt.Chart(pl.DataFrame(_prof_rows))
+        .mark_line()
+        .encode(
+            alt.X("step:Q", title="time step (onset-aligned)"),
+            alt.Y("shap:Q", title="mean |SHAP|"),
+            color=alt.Color("channel:N", title="channel"),
+            tooltip=["channel", "step", alt.Tooltip("shap:Q", format=".3f")],
+        )
+        .properties(
+            width=400, height=250, title="Temporal reliance (mean|SHAP| over time)"
+        )
+    )
+
+    # 3) beeswarm — per-row net channel push (Σ signed SHAP over time), coloured by
+    #    that channel's (normalized) mean level for the row.
+    _push = sv.sum(axis=2)  # (N, C)
+    _level = Xsq.mean(axis=2)  # (N, C) scaled channel level
+    _order = by_ch["channel"].to_list()
+    rng2 = np.random.RandomState(0)
+    _bee = []
+    for c, ch in enumerate(channels):
+        col = _level[:, c].astype(float)
+        lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
+        norm = (col - lo) / (hi - lo) if hi > lo else np.full_like(col, 0.5)
+        for i in range(sv.shape[0]):
+            _bee.append(
+                {
+                    "channel": ch,
+                    "shap": float(_push[i, c]),
+                    "level": float(norm[i]),
+                    "jitter": float(rng2.uniform(-0.35, 0.35)),
+                }
+            )
+    bee = (
+        alt.Chart(pl.DataFrame(_bee))
+        .mark_circle(size=26, opacity=0.65)
+        .encode(
+            x=alt.X(
+                "shap:Q",
+                title=f"Σ SHAP over time  (◀ {class_names[0]} · {class_names[1]} ▶)",
+            ),
+            y=alt.Y("channel:N", sort=_order, title=None),
+            yOffset="jitter:Q",
+            color=alt.Color(
+                "level:Q",
+                scale=alt.Scale(scheme="redblue", reverse=True),
+                title="channel level (low → high)",
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=["channel", alt.Tooltip("shap:Q", format=".3f")],
+        )
+        .properties(width=440, height=250, title="Per-row channel push — direction")
+    )
+    zero = (
+        alt.Chart(pl.DataFrame({"z": [0.0]}))
+        .mark_rule(color="#888", strokeDash=[4, 3])
+        .encode(x="z:Q")
+    )
+    # return mo.hstack([chart_ch, chart_time, bee + zero])
+    return mo.vstack(
+        [mo.hstack([chart_ch, bee + zero], justify="start"), chart_time],
+        align="stretch",
+    )
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## References
+
+    - **XGBoost** — Chen & Guestrin (2016), KDD. <https://arxiv.org/abs/1603.02754>
+    - **CatBoost** — Prokhorenkova et al. (2018), NeurIPS. <https://arxiv.org/abs/1706.09516>
+    - **Logistic regression (L2)** — scikit-learn `LogisticRegression`.
+    - **SHAP** — Lundberg & Lee (2017), NeurIPS. <https://arxiv.org/abs/1705.07874>
+    - **shapiq / TabPFN imputation explainer** — Muschalik et al. (2024), NeurIPS; `tabpfn-extensions`. <https://arxiv.org/abs/2410.01649>
+    - **TabPFN v3** — Hollmann et al. (2025), Nature. <https://www.nature.com/articles/s41586-024-08328-6>
+    - **StratifiedGroupKFold / LeaveOneGroupOut** — scikit-learn model selection.
+    - **ROCKET** (Track B) — Dempster, Petitjean & Webb (2020), DMKD. <https://arxiv.org/abs/1910.13051>
+    - **InceptionTime** (Track B) — Ismail Fawaz et al. (2020), DMKD. <https://arxiv.org/abs/1909.04939>
+    """)
+    return
+
+
+@app.cell
+def moment_shap_data():
+    mf_path = Path("derived/moment_features.parquet")
+    mc_path = Path("derived/moment_curves.parquet")
+    if mf_path.exists() and mc_path.exists():
+        Xm, ym, cnm, tm = read_tabular_features(mf_path, MOMENT_FEATURE_COLS)
+        m2i_m = {uid: i for i, uid in enumerate(tm["unit_id"].to_list())}
+        Xm_seq = read_time_series_curves(str(mc_path), m2i_m)
+        rk_m = RocketTransform(n_kernels=10000, seed=42).fit(Xm_seq)
+        Xm_rocket = rk_m.transform(Xm_seq)
+    return Xm, Xm_rocket, Xm_seq, cnm, rk_m, ym
+
+
+@app.cell
+def excursion_shap_tabs(excursion_shap_panels):
+    mo.ui.tabs(excursion_shap_panels)
+    return
+
+
+@app.cell
+def moment_shap_tabs(moment_shap_panels):
+    mo.ui.tabs(moment_shap_panels)
+    return
+
+
+@app.cell
+def excursion_shap_panel_dict(X, X_rocket, X_seq, class_names, rocket, y):
+    # SHAP charts for the excursion route, one panel per model family. The panel
+    # functions are decorated `@mo.persistent_cache`, so this cell's first run caches
+    # each fit+explainer to `__marimo__/cache/<fn>/` (gitignored, NDA-safe) keyed by
+    # its args; later runs — including slides.py reaching them through `Cell.run` —
+    # restore from disk (a bare-decorator cache survives `.run()`; a `with`-block one
+    # does not). Kept separate from the `mo.ui.tabs` cell (compute vs. display).
+    excursion_shap_panels = {
+        "XGBoost (Track A)": shap_feature_panel(X, y, class_names, FEATURE_COLS),
+        "Logistic (Track A)": logistic_shap_panel(X, y, class_names, FEATURE_COLS),
+        "TabPFN (Track A)": tabpfn_shap_panel(X, y, class_names, FEATURE_COLS)
+        if get_tabpfn_imputation_explainer is not None
+        else mo.md("> ⚠️ `tabpfn-extensions[interpretability]` not installed."),
+        "ROCKET (Track B)": rocket_shap_panel(
+            X_rocket, rocket.module_.kernel_specs(), class_names, y
+        ),
+        "InceptionTime (Track B)": inception_shap_panel(X_seq, y, class_names),
+    }
+    return (excursion_shap_panels,)
+
+
+@app.cell
+def moment_shap_panel_dict(Xm, Xm_rocket, Xm_seq, cnm, rk_m, ym):
+    # Moment-route SHAP charts (cached via the decorated panel fns; see `excursion_shap_panels`).
+    moment_shap_panels = {
+        "XGBoost": shap_feature_panel(Xm, ym, cnm, MOMENT_FEATURE_COLS),
+        "Logistic": logistic_shap_panel(Xm, ym, cnm, MOMENT_FEATURE_COLS),
+        "TabPFN": tabpfn_shap_panel(Xm, ym, cnm, MOMENT_FEATURE_COLS)
+        if get_tabpfn_imputation_explainer is not None
+        else mo.md("> ⚠️ `tabpfn-extensions[interpretability]` not installed."),
+        "ROCKET + XGBoost": rocket_shap_panel(
+            Xm_rocket, rk_m.module_.kernel_specs(), cnm, ym
+        ),
+        "InceptionTime": inception_shap_panel(Xm_seq, ym, cnm),
+    }
+    return (moment_shap_panels,)
 
 
 if __name__ == "__main__":

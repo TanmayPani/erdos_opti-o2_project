@@ -5,11 +5,21 @@ __marimo__/
 build/
 dist/
 wheels/
+ref_docs/
 *.egg-info
-.c*
+.serena/
+.claude/
 # Virtual environments
 .venv
 
 # Dataset archives
 *.zip
 NOAA_*
+
+# NDA data + DO-derived artifacts — public repo, NEVER commit. Kept local only;
+# copy datasets/ + derived/ onto the host by hand. Note: gitignore does not untrack
+# already-committed files — derived/events.parquet, derived/event_samples.parquet and
+# the NDA docs are in history and need `git rm --cached` + a history scrub (separate).
+datasets/
+derived/
+checkpoints/
