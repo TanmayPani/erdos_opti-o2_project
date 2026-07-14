@@ -18,6 +18,7 @@ dependencies = [
     "skorch>=1.4.0",
     "tabpfn-extensions[interpretability]>=0.4.2",
     "numba>=0.61.0,<0.63",
+    "ipython>=9.15.0",
 ]
 
 [dependency-groups]

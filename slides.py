@@ -102,19 +102,30 @@ def title():
 
 @app.cell(hide_code=True)
 def _():
-    mo.md("""
-    # Opti O2: Coastal Wetland \(DO_2\) Dynamics
-
+    mo.vstack(
+        [
+            mo.md("""
+    # Opti O2: Coastal Wetland \( DO_2 \) Dynamics
+    """),
+            mo.hstack(
+                [
+                    mo.md("""
     * **The Site**: Beaver Creek, WA — a former freshwater floodplain transitioning to a coastal wetland.
     * **The Data**: 6-year, 5-minute resolution time-series of subsurface **Dissolved Oxygen (\(DO_2\))**, **Hydrology** (*Water level*, *Salinity*, etc.), and **Weather** (*Temperature*, *Precipitation*, etc.) timeseries data
     * **The Phenomena**:
-      - **\(DO_{2} \approx 0 \)** for 92% of timestamps (Anoxic baseline)
+      - **\(DO_2 \) ~ 0** for 92% of timestamps (Anoxic baseline)
       - **\(DO_2\) event:** Sufficient departure from the baseline (\(\Delta DO_2 > 0.1\)mg/L)
 
     * **The Challenge**: Classifying \(DO_2\) events into:
       - **Hot Moments** (abrupt asymmetric and tidal/salinity-driven)
       - **Oxic Pulses** (symmetric and freshwater/precipitation-driven)
-    """)
+    """),
+                    mo.image("assets/intro_beaver_creek.png", height=500),
+                ],
+                justify="start",
+            ),
+        ]
+    )
     return
 
 
@@ -145,8 +156,8 @@ def viewer(event_picker, shade_mode):
 
 @app.cell(hide_code=True)
 def _():
-    _moment_features = pl.read_parquet("derived/moment_features.parquet")
-    _moment_curves = pl.read_parquet("derived/moment_curves.parquet")
+    _moment_features = pl.read_parquet("derived/processed_moments_features.parquet")
+    _moment_curves = pl.read_parquet("derived/processed_moments_curves.parquet")
 
     # _moment_features.head()
     _tabs = feature_methodology_tabs(_moment_features, _moment_curves)
@@ -201,21 +212,15 @@ def _(disc_events):
                 [
                     mo.ui.tabs(_mom_shap),
                     mo.md(r"""
-        * Hot vs Oxic signal carry mix of Weather/Hydrology-based drivers
-        * ## Supervised
             - **SHAP scores, Engineered Features (XGBoost, Logistic, TabPFN):**
-                - Higher score \(\implies\) More discriminating power
                 - Best scores &rarr; **Hydrology-based**
                 e.g., \(\frac{d(DO_2)}{dt}\) (*rise_rate*), \(\frac{t_{\rm peak-DO_2} - t_{\rm start}}{t_{\rm end} - t_{\rm start}}\) (*peak_frac*), \(\Delta \text{Salinity}\) (*sal_step*), \(\max{(DO_2)}\) (*peak_do*)
                 - Worst scores &rarr;**Weather-based:** e.g., Air Temperature (temp_in), Cumulative Antecedent Precipitation (precip_168h)  
             - **SHAP scores, Time Series (ROCKET+XGBoost, InceptionTime):**
-                - Per-channel mean of SHAP scores for the 20000 ROCKET features and GradientSHAP for InceptionTime 
                 - \(DO_2\) and Temperature most important, Precipitaiton least
                 - ROCKET kernels with bigger dilation (time-scales) more important (correlations over ~40-80 minutes)
 
-        * ## Unsupervised
-            - Mutual information (MI) &rarr; Dependency between 2 variables (Unsupervised)
-            - Independently validates conclusions from SHAP
+            - Mutual information (unsupervised) validates conclusions from SHAP
                       """),
                 ],
                 justify="start",

@@ -18,7 +18,6 @@ with app.setup:
         WL_COL,
         PRECIP_COL,
     )
-    from core.checks import detection_agreement
 
     from utils import feature_methodology_tabs
 
@@ -31,7 +30,7 @@ def _():
     # Exploratory views — Beaver Creek DO events (NDA)
 
     The **preprocessing pipeline** lives in `preprocessing.py` and writes the
-    model-ready `derived/proc_features.parquet` + `derived/proc_curves.parquet`
+    model-ready `derived/processed_auto_features.parquet` + `derived/processed_auto_curves.parquet`
     plus the reference tables. This notebook holds the **exploratory visualisations**
     moved out of that pipeline: how the expert classes separate in the physics
     features, an interactive per-event browser with our detector's splice track, an
@@ -46,21 +45,16 @@ def _():
 def reading():
     events = pl.read_parquet("derived/expert_event_list.parquet")
     readouts = pl.read_parquet("derived/readouts.parquet")
-    proc = pl.read_parquet("derived/proc_features.parquet")
-    _b = proc.group_by("split", "regime").len().sort("split", "regime")
+    proc = pl.read_parquet("derived/processed_auto_features.parquet")
+    _b = proc.group_by("split", "expert_label").len().sort("split", "expert_label")
 
     _r0, _r1 = readouts["Datetime"].min(), readouts["Datetime"].max()
-    _in_range = (pl.col("group_end") >= _r0) & (pl.col("group_start") <= _r1)
+    _in_range = (pl.col("end_time") >= _r0) & (pl.col("start_time") <= _r1)
     events_covered = events.filter(_in_range)
 
-    expert_moments = pl.read_parquet("derived/expert_event_list.parquet")
-    expert_events_full = pl.read_parquet("derived/expert_events.parquet")
-    expert_samples = pl.read_parquet("derived/expert_event_samples.parquet")
-
-    # catalogued orphans (auto excursions with no expert umbrella) — proper YYYY-N{h|o|x}
-    # ids + is_orphan + driver_class, built by preprocessing.py; browsed here in place.
-    orphan_feat = pl.read_parquet("derived/orphan_events.parquet")
-    orphan_samples = pl.read_parquet("derived/orphan_event_samples.parquet")
+    expert_moments = pl.read_parquet("derived/expert_moment_list.parquet")
+    expert_events_full = pl.read_parquet("derived/processed_expert_features.parquet")
+    expert_samples = pl.read_parquet("derived/expert_samples.parquet")
 
     auto_events = auto_detected_events(readouts)
     return (
@@ -70,15 +64,13 @@ def reading():
         expert_events_full,
         expert_moments,
         expert_samples,
-        orphan_feat,
-        orphan_samples,
         proc,
         readouts,
     )
 
 
 @app.cell
-def ui_elements(events, events_covered, orphan_feat):
+def ui_elements(events, events_covered):
     _axis_opts = [
         "dur_min",
         "n_samples",
@@ -99,22 +91,15 @@ def ui_elements(events, events_covered, orphan_feat):
     y_var = mo.ui.dropdown(options=_axis_opts, value="wl_step", label="y axis")
 
     _cov_ids = set(events_covered["event_id"])
-    # unified picker: expert umbrellas + catalogued orphans, ordered by OCCURRENCE (time).
+    # picker: expert umbrellas, ordered by OCCURRENCE (time).
     _rows = [
         (
-            r["group_start"],
+            r["start_time"],
             r["event_id"],
             f"{r['event_id']}  —  {r['expert_label']} ({r['expert_subtype']})"
             + ("" if r["event_id"] in _cov_ids else "   ⚠ no coverage"),
         )
         for r in events.iter_rows(named=True)
-    ] + [
-        (
-            r["start"],
-            r["event_id"],
-            f"{r['event_id']}  —  ⚠ orphan · {r['driver_class']}",
-        )
-        for r in orphan_feat.iter_rows(named=True)
     ]
     _rows.sort(key=lambda t: t[0])
     _opts = {_lbl: _eid for _, _eid, _lbl in _rows}
@@ -138,16 +123,11 @@ def event_detection(
     expert_events_full,
     expert_moments,
     expert_samples,
-    orphan_feat,
-    orphan_samples,
     readouts,
     shade_mode,
 ):
     _eid = event_picker.value
-    # orphans (our auto events with no expert umbrella) are selectable in the picker; they
-    # are not in `events`, so resolve which frame the selection lives in.
-    _is_orphan = _eid not in set(events["event_id"])
-    _samples = orphan_samples if _is_orphan else expert_samples
+    _samples = expert_samples
     _s = (
         _samples.filter(pl.col("event_id") == _eid)
         .sort("Datetime")
@@ -163,12 +143,6 @@ def event_detection(
     def _fmt(v, f="{:.2f}"):
         return f.format(v) if v is not None else "—"
 
-    _agree = detection_agreement(readouts, events_covered)
-    # orphan breakdown for the always-visible flag line
-    _ocls = orphan_feat.group_by("driver_class").len().sort("len", descending=True)
-    _ocls_txt = ", ".join(
-        f"{r['len']} {r['driver_class']}" for r in _ocls.iter_rows(named=True)
-    )
     _event_detection_snip = mo.md(
         """
         #Event Detection
@@ -178,7 +152,7 @@ def event_detection(
         """
     )
 
-    if not _is_orphan and _s.height == 0:
+    if _s.height == 0:
         _meta = events.filter(pl.col("event_id") == _eid).to_dicts()[0]
         _out = mo.vstack(
             [
@@ -188,7 +162,7 @@ def event_detection(
                     f"""
             ### {_eid} — expert **{_meta["expert_label"]}** (`{_meta["expert_subtype"]}`)
 
-            window **{_meta["group_start"]:%Y-%m-%d %H:%M} → {_meta["group_end"]:%Y-%m-%d %H:%M}**
+            window **{_meta["start_time"]:%Y-%m-%d %H:%M} → {_meta["end_time"]:%Y-%m-%d %H:%M}**
 
             ⚠ **No readout coverage.** This event falls outside the readout span
             ({readouts["Datetime"].min():%Y-%m-%d} → {readouts["Datetime"].max():%Y-%m-%d}), so there is **no time series to plot**.
@@ -213,72 +187,43 @@ def event_detection(
             )
         )
 
-        if _is_orphan:
-            _row = orphan_feat.filter(pl.col("event_id") == _eid).to_dicts()[0]
-            _title = f"{_eid} — orphan · {_row['driver_class']}"
-            _peaks = _s.head(0).select("Datetime")  # no expert moments for an orphan
-            _details = mo.md(
-                f"""
-                ### {_eid} — ⚠ **orphan** · {_row["driver_class"]}
+        _row = expert_events_full.filter(pl.col("event_id") == _eid).to_dicts()[0]
+        _title = f"{_eid} — {_row['expert_label']} ({_row['expert_subtype']})"
+        _peaks = (
+            expert_moments.filter(pl.col("event_id") == _eid)
+            .select(pl.col("m_peak_do_ts").alias("Datetime"))  # flat: one row/moment
+            .drop_nulls()
+        )
+        # workbook LEGEND ("hot moment and oxic pulse classification.xlsx") decoded to the
+        # fine suffixes used in the moments list (o1..o5 in the sheet's listed order).
+        _SUBTYPE_MEANING = {
+            "h": "hot moment — tidal DO incursion (water-level rise + salinity step)",
+            "b": "unclassified hot moment (held out)",
+            "hx": "mixed — a symmetric pulse coincident with a salinity step",
+            "e": "oxic event during a flood",
+            "o1": "oxic pulse — no change in salinity",
+            "o2": "oxic pulse — adiabatic change in salinity",
+            "o3": "oxic pulse — prior to flooding",
+            "o4": "oxic pulse — during / following flooding",
+            "o5": "oxic pulse — coincident with rainfall",
+        }
+        _code = _row["expert_subtype"]
+        _code_txt = _SUBTYPE_MEANING.get(_code, _SUBTYPE_MEANING.get(_code[:1], "—"))
+        _details = mo.md(
+            f"""
+            ### {_eid} — **{_row["expert_label"]}** (`{_row["expert_subtype"]}`)
 
-                *No expert umbrella covers this auto-detected excursion — **uncatalogued, not
-                excluded**. Classed by its driver signature; the dates the experts later
-                **adopted** as inferred units are flagged.*
-
-                - window: **{_row["start"]:%Y-%m-%d %H:%M} → {_row["end"]:%Y-%m-%d %H:%M}**
-                ({_row["dur_min"] / 60:.1f} h)
-                - driver class: **{_row["driver_class"]}**
-                - is_orphan: **{_row["is_orphan"]}**
-                - peak DO: **{_fmt(_row["peak_do"])} mg/L**
-                - salinity step: **{_fmt(_row["sal_step"], "{:+.2f}")}**
-                - water level step: **{_fmt(_row["wl_step"], "{:+.2f}")}**
-                - antecedent precipitation (24 hours): **{_fmt(_row["precip_24h"], "{:.1f}")}**
-                - centroid_frac: **{_fmt(_row["centroid_frac"], "{:.2f}")}** · max_rise_norm: **{_fmt(_row["max_rise_norm"], "{:.2f}")}**
-                """
-            )
-        else:
-            _row = expert_events_full.filter(pl.col("event_id") == _eid).to_dicts()[0]
-            _title = f"{_eid} — {_row['expert_label']} ({_row['expert_subtype']})"
-            _peaks = (
-                expert_moments.filter(pl.col("event_id") == _eid)
-                .select(pl.col("moments.do_peak_time").alias("Datetime"))
-                .explode(
-                    "Datetime", empty_as_null=True
-                )  # moments.* is a list column; flatten to plot rules
-                .drop_nulls()
-            )
-            # workbook LEGEND ("hot moment and oxic pulse classification.xlsx") decoded to the
-            # fine suffixes used in the moments list (o1..o5 in the sheet's listed order).
-            _SUBTYPE_MEANING = {
-                "h": "hot moment — tidal DO incursion (water-level rise + salinity step)",
-                "b": "unclassified hot moment (held out)",
-                "hx": "mixed — a symmetric pulse coincident with a salinity step",
-                "e": "oxic event during a flood",
-                "o1": "oxic pulse — no change in salinity",
-                "o2": "oxic pulse — adiabatic change in salinity",
-                "o3": "oxic pulse — prior to flooding",
-                "o4": "oxic pulse — during / following flooding",
-                "o5": "oxic pulse — coincident with rainfall",
-            }
-            _code = _row["expert_subtype"]
-            _code_txt = _SUBTYPE_MEANING.get(
-                _code, _SUBTYPE_MEANING.get(_code[:1], "—")
-            )
-            _details = mo.md(
-                f"""
-                ### {_eid} — **{_row["expert_label"]}** (`{_row["expert_subtype"]}`)
-
-                - window: **{_row["start"]:%Y-%m-%d %H:%M} → {_row["end"]:%Y-%m-%d %H:%M}**
-                ({_row["dur_min"] / 60:.1f} h)
-                - classification code `{_code}`: {_code_txt}
-                - peak \(DO_2\): **{_fmt(_row["peak_do"])} mg/L**
-                - salinity step: **{_fmt(_row["sal_step"], "{:+.2f}")}**
-                - water level step: **{_fmt(_row["wl_step"], "{:+.2f}")}**
-                - antecedent precipitation (24 hours): **{_fmt(_row["precip_24h"], "{:.1f}")}**
-                - flooding: **{_row["flooding"]}**
-                - number of DO excursions: **{_splice.height} event(s)**
-                """
-            )
+            - window: **{_row["start_time"]:%Y-%m-%d %H:%M} → {_row["end_time"]:%Y-%m-%d %H:%M}**
+            ({_row["dur_min"] / 60:.1f} h)
+            - classification code `{_code}`: {_code_txt}
+            - peak \(DO_2\): **{_fmt(_row["peak_do"])} mg/L**
+            - salinity step: **{_fmt(_row["sal_step"], "{:+.2f}")}**
+            - water level step: **{_fmt(_row["wl_step"], "{:+.2f}")}**
+            - antecedent precipitation (24 hours): **{_fmt(_row["precip_24h"], "{:.1f}")}**
+            - flooding: **{events.filter(pl.col("event_id") == _eid)["flooding"][0]}**
+            - number of DO excursions: **{_splice.height} event(s)**
+            """
+        )
 
         # --- Dr. Ghosh's multi-axis event format (deck slides 10-14): one panel, four
         # colour-matched y-axes stacked via Axis(offset=...) on layers with independent
@@ -352,12 +297,11 @@ def event_detection(
         _mrects = (
             expert_moments.filter(pl.col("event_id") == _eid)
             .select(
-                pl.col("moments.idx").alias("m_no"),
-                pl.col("moments.type").alias("m_type"),
-                pl.col("moments.start_time").alias("m_start"),
-                pl.col("moments.end_time").alias("m_end"),
+                pl.col("moment_idx").alias("m_no"),
+                pl.col("type").alias("m_type"),
+                pl.col("start_time").alias("m_start"),
+                pl.col("end_time").alias("m_end"),
             )
-            .explode("m_no", "m_type", "m_start", "m_end", empty_as_null=True)
             .drop_nulls(["m_start", "m_end"])
             .with_columns(
                 pl.max_horizontal("m_start", pl.lit(_start_t)).alias("m_start"),
@@ -419,11 +363,11 @@ def event_detection(
 
 @app.cell
 def label_survey():
-    _mom_features = pl.read_parquet("derived/moment_features.parquet").with_columns(
-        pl.col("label").replace({"pulse": "oxic"}).alias("class")
-    )
+    _mom_features = pl.read_parquet(
+        "derived/processed_moments_features.parquet"
+    ).with_columns(pl.col("label").replace({"pulse": "oxic"}).alias("class"))
     _drift = (
-        _mom_features.with_columns(pl.col("start").dt.year().alias("year"))
+        _mom_features.with_columns(pl.col("start_time").dt.year().alias("year"))
         .group_by("year")
         .agg(
             pl.len().alias("n_events"),
@@ -456,8 +400,8 @@ def label_survey():
 
     _SEASONS = ["Winter (DJF)", "Spring (MAM)", "Summer (JJA)", "Fall (SON)"]
     _ev = _mom_features.filter(pl.col("class").is_in(["hot", "oxic"])).with_columns(
-        ((pl.col("start").dt.month() % 12) // 3).alias("_sidx"),
-        pl.col("start").dt.month().alias("month"),
+        ((pl.col("start_time").dt.month() % 12) // 3).alias("_sidx"),
+        pl.col("start_time").dt.month().alias("month"),
     )
     _by_season = (
         _ev.group_by("_sidx", "label")
@@ -525,7 +469,7 @@ def label_survey_1(proc, x_var, y_var):
             size=alt.Size(
                 "peak_do:Q", title="peak DO (mg/L)", scale=alt.Scale(range=[30, 400])
             ),
-            tooltip=["regime:N", "group_id:N", "start:T", "end:T", "peak_do:Q"],
+            tooltip=["regime:N", "event_id:N", "start:T", "end:T", "peak_do:Q"],
         )
         .properties(
             width=500, height=300, title="Expert classes separation in feature space"
@@ -568,11 +512,11 @@ def record_overview(events, readouts):
     )
 
     # expert-labelled events falling outside the readout span, at each end
-    _before = events.filter(pl.col("group_end") < _r0)
-    _after = events.filter(pl.col("group_start") > _r1)
+    _before = events.filter(pl.col("end_time") < _r0)
+    _after = events.filter(pl.col("start_time") > _r1)
     _gap_rows = []
     if _before.height:
-        _lo = _before["group_start"].min()
+        _lo = _before["start_time"].min()
         _gap_rows.append(
             {
                 "x": _lo,
@@ -582,7 +526,7 @@ def record_overview(events, readouts):
             }
         )
     if _after.height:
-        _hi = _after["group_end"].max()
+        _hi = _after["end_time"].max()
         _gap_rows.append(
             {
                 "x": _r1,
@@ -680,11 +624,11 @@ def record_overview(events, readouts):
         "**end-bands are expert-labelled periods with no readout coverage** — "
     )
     if _before.height:
-        _cap += f"**{(_r0 - _before['group_start'].min()).days} d / {_before.height} events** before it begins"
+        _cap += f"**{(_r0 - _before['start_time'].min()).days} d / {_before.height} events** before it begins"
     if _before.height and _after.height:
         _cap += " and "
     if _after.height:
-        _cap += f"**{(_after['group_end'].max() - _r1).days} d / {_after.height} events** after it ends"
+        _cap += f"**{(_after['end_time'].max() - _r1).days} d / {_after.height} events** after it ends"
     _cap += "."
 
     mo.vstack(
@@ -834,112 +778,8 @@ def feature_methodology_intro():
 
 @app.cell
 def feature_methodology(proc):
-    proc_curves = pl.read_parquet("derived/proc_curves.parquet")
+    proc_curves = pl.read_parquet("derived/processed_auto_curves.parquet")
     feature_methodology_tabs(proc, proc_curves)
-    return
-
-
-@app.cell
-def detection_scorecard(auto_events, events_covered, readouts):
-    _auto = auto_events.select("eid", "start", "end")
-    _exp = events_covered.select("event_id", "group_start", "group_end", "expert_label")
-
-    _pairs = (
-        _exp.join_where(
-            _auto,
-            pl.col("start") <= pl.col("group_end"),
-            pl.col("end") >= pl.col("group_start"),
-        )
-        .with_columns(
-            _inter=(
-                pl.min_horizontal("end", "group_end")
-                - pl.max_horizontal("start", "group_start")
-            ).dt.total_seconds(),
-            _union=(
-                pl.max_horizontal("end", "group_end")
-                - pl.min_horizontal("start", "group_start")
-            ).dt.total_seconds(),
-            onset_offset_h=(pl.col("start") - pl.col("group_start")).dt.total_seconds()
-            / 3600.0,
-        )
-        .with_columns(iou=pl.col("_inter") / pl.col("_union"))
-    )
-    matched = (
-        _pairs.sort("_inter", descending=True)
-        .group_by("event_id", maintain_order=True)
-        .first()
-    )
-    _hit_auto = _pairs["eid"].unique()
-
-    _n_exp, _n_auto = _exp.height, _auto.height
-    _recall = matched.height / _n_exp
-    _precision = _auto.filter(pl.col("eid").is_in(_hit_auto.implode())).height / _n_auto
-    _f1 = (
-        2 * _precision * _recall / (_precision + _recall)
-        if (_precision + _recall)
-        else 0.0
-    )
-    _raw_recall = detection_agreement(readouts, events_covered)["recall"]
-    _med_iou = float(matched["iou"].median())
-    _med_off = float(matched["onset_offset_h"].median())
-
-    scorecard = pl.DataFrame(
-        [
-            {"metric": "precision (peak≥0.1 units)", "value": round(_precision, 3)},
-            {"metric": "recall (peak≥0.1 units)", "value": round(_recall, 3)},
-            {"metric": "event-level F1", "value": round(_f1, 3)},
-            {
-                "metric": "recall (raw detect_events, ref)",
-                "value": round(_raw_recall, 3),
-            },
-            {"metric": "median IoU (matched)", "value": round(_med_iou, 3)},
-            {"metric": "median onset offset (h)", "value": round(_med_off, 2)},
-        ]
-    )
-    _iou_hist = (
-        alt.Chart(matched, title="IoU of best-overlap matches")
-        .mark_bar(color="#4575b4")
-        .encode(
-            x=alt.X("iou:Q", bin=alt.Bin(maxbins=20), title="IoU (auto ∩ expert / ∪)"),
-            y=alt.Y("count():Q", title="matched windows"),
-        )
-        .properties(width=360, height=220)
-    )
-    _lead_hist = (
-        alt.Chart(matched, title="Onset offset (auto − expert)")
-        .mark_bar(color="#91bfdb")
-        .encode(
-            x=alt.X(
-                "onset_offset_h:Q",
-                bin=alt.Bin(maxbins=25),
-                title="hours (− = auto fires earlier)",
-            ),
-            y=alt.Y("count():Q", title="matched windows"),
-        )
-        .properties(width=360, height=220)
-    )
-
-    mo.vstack(
-        [
-            mo.md(
-                f"""
-                ### Detection scorecard — event & onset level (KPI #2)
-
-                Scored at **event/onset level**, never with point-adjusted F1 (under PA a random
-                anomaly score beats SOTA — Kim et al. AAAI'22, arXiv 2109.05257). The peak≥0.1 unit
-                set ({_n_auto} auto events = the modeling units) vs {_n_exp} covered expert umbrellas,
-                interval overlap: **precision {_precision:.0%} · recall {_recall:.0%} · F1 {_f1:.2f}**,
-                median matched **IoU {_med_iou:.2f}**, median **onset offset {_med_off:+.1f} h**. The
-                raw (unfiltered) `detect_events` hits **{_raw_recall:.0%}** of windows — the peak≥0.1
-                filter trades those few low-peak recoveries for far fewer spurious detections (a
-                precision/recall tradeoff). Uncatalogued-but-real orphans (audit below) make precision
-                a mild lower bound
-                """
-            ),
-            mo.ui.table(scorecard, selection=None),
-            mo.hstack([_iou_hist, _lead_hist], justify="start"),
-        ]
-    )
     return
 
 

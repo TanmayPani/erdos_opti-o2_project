@@ -35,16 +35,13 @@ with app.setup:
         shapiq_to_shap_explanation = None
 
     from core.features import FEATURE_COLS, MOMENT_FEATURE_COLS
-    from core.model import RocketTransform
+    from core.estimator import RocketTransform
 
     # All model factories, CV harnesses, data readers, and the results formatter
     # live in `training.py` — the plain script that runs the full grouped-CV sweep
     # and writes `derived/model_results.parquet`. This notebook only *loads* those
     # precomputed tables and adds the SHAP / boundary explainability on top.
     from training import (
-        fmt_stat,
-        display_table,
-        compare_modes,
         xgb_fn,
         logreg_fn,
         inception_fn,
@@ -501,17 +498,17 @@ def _():
 
     Classifying detected dissolved-oxygen excursions as **hot moment** vs **oxic
     pulse**, on the real **NDA expert labels** (via `preprocessing.py` →
-    `derived/proc_features.parquet`). *Mixed* (`hx`) events and the undefined `b`
+    `derived/processed_auto_features.parquet`). *Mixed* (`hx`) events and the undefined `b`
     subtype are held out (`split=="holdout"`) — the next section asks where the
     binary model puts them.
 
     - **Unit** = an auto-detected DO excursion, nested in the expert umbrella that
-      supplies its class (`group_id`); a few audited orphans were adopted with
+      supplies its class (`event_id`); a few audited orphans were adopted with
       `label_source="inferred"`.
     - **Target** = binary `label` on `split=="train"`; only the 24 `FEATURE_COLS`
       enter X (metadata columns never do). Live counts are printed by the load cell
       below.
-    - **CV** = **StratifiedGroupKFold on `group_id`** so an umbrella's nested units
+    - **CV** = **StratifiedGroupKFold on `event_id`** so an umbrella's nested units
       never straddle a fold (the leakage the old plain-stratified harness allowed),
       plus **leave-one-group-out** as a small-*n* robustness estimate. Metrics lead
       with **macro-F1** and **balanced accuracy** (the class imbalance).
@@ -524,11 +521,13 @@ def _():
 
 @app.cell
 def _():
-    X, y, class_names, train = read_tabular_features("derived/proc_features.parquet")
+    X, y, class_names, train = read_tabular_features(
+        "derived/processed_auto_features.parquet"
+    )
     class_labels = list(range(len(class_names)))
-    groups = train["group_id"].to_numpy()
+    groups = train["event_id"].to_numpy()
 
-    proc = pl.read_parquet("derived/proc_features.parquet")
+    proc = pl.read_parquet("derived/processed_auto_features.parquet")
     # Precomputed grouped-CV sweeps (all tables, mean ± std) — this notebook loads them
     # rather than re-running TabPFN / ROCKET / InceptionTime folds. `training.py` writes
     # one per route: `model_results.parquet` (excursion, `--mode excursion`) and
@@ -608,11 +607,11 @@ def metrics_routes_plot(
     if model_results_moment is not None:
         _frames["moment"] = model_results_moment
 
-    _n_exc = f"{train.height} units / {train['group_id'].n_unique()} umbrellas"
-    _mp = pl.read_parquet("derived/moment_features.parquet").filter(
+    _n_exc = f"{train.height} units / {train['event_id'].n_unique()} umbrellas"
+    _mp = pl.read_parquet("derived/processed_moments_features.parquet").filter(
         pl.col("split") == "train"
     )
-    _n_mom = f"{_mp.height} moments / {_mp['group_id'].n_unique()} umbrellas"
+    _n_mom = f"{_mp.height} moments / {_mp['event_id'].n_unique()} umbrellas"
 
     _note = (
         "> ⚠️ **Moment route not yet computed** — run `.venv/bin/python training.py "
@@ -625,7 +624,7 @@ def metrics_routes_plot(
         [
             # mo.md(
             #    _note + f"**Trainable events:** excursion = {_n_exc}; moment = {_n_mom}. "
-            #    "Both use StratifiedGroupKFold on the umbrella `group_id`, so the moment route "
+            #    "Both use StratifiedGroupKFold on the umbrella `event_id`, so the moment route "
             #    "(more, tighter events) and the excursion route (fewer, wider windows) are "
             #    "graded on the same leakage-safe basis. Bars bunch the two routes per model; "
             #    "metric = tabs, whiskers = ±std across the 25 grouped-CV folds."
@@ -852,7 +851,7 @@ def _():
     ### Synthesis & honest caveats
 
     - **Grouped CV is the point.** Nested units from one expert umbrella share a
-      `group_id` and are kept on one side of every split, so scores are not inflated
+      `event_id` and are kept on one side of every split, so scores are not inflated
       by near-duplicate excursions leaking across folds — the flaw in a plain
       stratified split at this granularity.
     - **Tiny, imbalanced *n*.** Read **macro-F1 / balanced accuracy / MCC**, not
@@ -886,9 +885,9 @@ def _():
 @app.cell
 def _(X, class_names, groups, y):
     _hold = (
-        pl.read_parquet("derived/proc_features.parquet")
+        pl.read_parquet("derived/processed_auto_features.parquet")
         .filter(pl.col("split") == "holdout")
-        .sort("group_id", "start")
+        .sort("event_id", "start_time")
     )
     _Xh = _hold.select(FEATURE_COLS).to_numpy().astype(float)
 
@@ -915,7 +914,7 @@ def _(X, class_names, groups, y):
     # Per-event table for the held-out events (why they are ambiguous: pulse-like rise
     # + a hot-like salinity step). sal_step / wl_step / rise_rate are the decisive features.
     mixed_boundary = (
-        _hold.select(["group_id", "expert_subtype", "sal_step", "wl_step", "rise_rate"])
+        _hold.select(["event_id", "expert_subtype", "sal_step", "wl_step", "rise_rate"])
         .with_columns(
             p_pulse=pl.Series(_ph).round(3),
             entropy_bits=pl.Series(_Hh).round(3),
@@ -999,7 +998,7 @@ def _():
 @app.cell
 def _(train):
     _m2i = {uid: i for i, uid in enumerate(train["unit_id"].to_list())}
-    X_seq = read_time_series_curves("derived/proc_curves.parquet", _m2i)
+    X_seq = read_time_series_curves("derived/processed_auto_curves.parquet", _m2i)
     rocket = RocketTransform(n_kernels=10000, seed=42).fit(X_seq)
     X_rocket = rocket.transform(X_seq)
     mo.md(
@@ -1177,8 +1176,8 @@ def _():
 
 @app.cell
 def moment_shap_data():
-    mf_path = Path("derived/moment_features.parquet")
-    mc_path = Path("derived/moment_curves.parquet")
+    mf_path = Path("derived/processed_moments_features.parquet")
+    mc_path = Path("derived/processed_moments_curves.parquet")
     if mf_path.exists() and mc_path.exists():
         Xm, ym, cnm, tm = read_tabular_features(mf_path, MOMENT_FEATURE_COLS)
         m2i_m = {uid: i for i, uid in enumerate(tm["unit_id"].to_list())}

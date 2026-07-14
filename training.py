@@ -32,8 +32,13 @@ from skorch.callbacks import LRScheduler, GradientNormClipping
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from core.features import FEATURE_COLS, MOMENT_FEATURE_COLS
-from core.model import RocketTransform, InceptionTimeLite, FocalLoss, ChannelScaler
-from core.model import LogisticRegression, LogitsNetClassifier
+from core.nn import InceptionTimeLite, FocalLoss
+from core.estimator import (
+    ChannelScaler,
+    RocketTransform,
+    LogisticRegression,
+    LogitsNetClassifier,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -43,15 +48,15 @@ warnings.filterwarnings("ignore")
 # results file so it never clobbers the excursion-route artifact.
 MODES = {
     "excursion": dict(
-        features="derived/proc_features.parquet",
-        curves="derived/proc_curves.parquet",
+        features="derived/processed_auto_features.parquet",
+        curves="derived/processed_auto_curves.parquet",
         wide="derived/proc_curves_wide.parquet",
         results="derived/model_results.parquet",
         feature_cols=FEATURE_COLS,
     ),
     "moment": dict(
-        features="derived/moment_features.parquet",
-        curves="derived/moment_curves.parquet",
+        features="derived/processed_moments_features.parquet",
+        curves="derived/processed_moments_curves.parquet",
         wide=None,
         results="derived/model_results_moment.parquet",
         feature_cols=MOMENT_FEATURE_COLS,
@@ -320,7 +325,7 @@ def read_tabular_features(path, feature_cols=FEATURE_COLS):
     data = (
         pl.read_parquet(path)
         .filter(pl.col("split") == "train")
-        .sort("group_id", "start")
+        .sort("event_id", "start_time")
     )
 
     X = data.select(feature_cols).to_numpy().astype(float)
@@ -514,7 +519,7 @@ def main(mode="excursion"):
         "TabPFN v3": tabpfn_pipeline_fn,
     }
 
-    groups = data["group_id"].to_numpy()
+    groups = data["event_id"].to_numpy()
     class_labels = list(range(len(_class_names)))
 
     print("\n===== engineered features =====")
@@ -542,7 +547,7 @@ def main(mode="excursion"):
         X_tab,
         y,
         class_labels,
-        data["start"].to_numpy(),
+        data["start_time"].to_numpy(),
     )
     _report("base_temporal", base_temporal_split)
 

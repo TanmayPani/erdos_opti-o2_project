@@ -2,75 +2,39 @@ from pathlib import Path
 import polars as pl
 
 from core.io import read_one_year, read_expert_event_list, reformat_expert_workbook
-from core.features import (
-    sync_expert_features,
-    enrich_expert_events,
-    build_units,
-    catalogue_orphans,
-    finalize_units,
-    finalize_moments,
-    explode_moments,
-    build_curves,
-)
+from core.features import splice_readouts, event_samples
 
 
-def preprocess(readouts, expert_labels, output_dir):
+def preprocess(readouts, expert_labels, expert_events, output_dir, prefix="auto_"):
     _r0, _r1 = readouts["Datetime"].min(), readouts["Datetime"].max()
-    # raw expert list (all non-ignore events, incl. those outside the readout span) —
-    # saved verbatim so eda.py can read it instead of re-parsing the workbook.
-    expert_event_list = expert_labels.filter(pl.col("expert_label") != "ignore").sort(
-        "group_start"
+
+    expert_slices_covered = (
+        expert_labels.sort("start_time").filter(
+            (pl.col("start_time") >= _r0) & (pl.col("start_time") <= _r1)
+        )
+        if expert_labels is not None
+        else None
     )
 
-    _in_range = (pl.col("group_end") >= _r0) & (pl.col("group_start") <= _r1)
-    events_covered = expert_event_list.filter(_in_range)
-
-    expert_events, expert_samples = sync_expert_features(readouts, events_covered)
-    orphan_events, orphan_samples = catalogue_orphans(
-        readouts, events_covered, expert_events["event_id"].to_list()
+    expert_events_covered = (
+        expert_events.sort("start_time").filter(
+            (pl.col("start_time") >= _r0) & (pl.col("start_time") <= _r1)
+        )
+        if expert_events is not None
+        else None
     )
 
-    expert_events_full = enrich_expert_events(expert_events, events_covered)
-    _n_expert_features = expert_events_full.width - expert_events.width
-
-    # `2024-08-19` and `2021-12-08` are now recovered as real expert umbrellas (2024-2o3 /
-    # 2021-10o1) by the window-completeness parser, so adopting them here is redundant (verified
-    # byte-identical proc either way). `2024-08-19` was also mis-adopted as `hot`; the expert
-    # workbook labels event #2's 08-19 an oxic pulse (o3), and it now correctly follows that.
-    ADOPT_ORPHANS = {"2023-07-04": "hot"}
-    _units, _, _ = build_units(readouts, events_covered, adopt_orphans=ADOPT_ORPHANS)
-    _unit_feat, _ = sync_expert_features(
-        readouts, _units.rename({"unit_id": "event_id"})
-    )
-
-    proc = finalize_units(_unit_feat, _units, expert_events)
-
-    curves = build_curves(readouts, proc).join(
-        proc.select("unit_id", "is_public_augmented"), on="unit_id", how="left"
-    )
-
-    # MOMENT ROUTE — mirror of the unit route at moment granularity: classify each expert
-    # moment (its own expert window + direct hot/oxic label) instead of an auto-detected unit.
-    # No orphans, no weak supervision, no `mixed` holdout; hysteresis dropped (MOMENT_FEATURE_COLS).
-    mom_frame = explode_moments(events_covered)
-    _mom_feat, _ = sync_expert_features(readouts, mom_frame)
-    moment_proc = finalize_moments(_mom_feat, mom_frame)
-    moment_curves = build_curves(readouts, moment_proc).join(
-        moment_proc.select("unit_id", "is_public_augmented"), on="unit_id", how="left"
+    proc, curves = splice_readouts(
+        readouts, events=expert_events_covered, umbrella=expert_slices_covered
     )
 
     output_dir.mkdir(exist_ok=True)
 
-    proc.write_parquet(output_dir / "proc_features.parquet")
-    curves.write_parquet(output_dir / "proc_curves.parquet")
-    moment_proc.write_parquet(output_dir / "moment_features.parquet")
-    moment_curves.write_parquet(output_dir / "moment_curves.parquet")
-    readouts.write_parquet(output_dir / "readouts.parquet")
-    expert_event_list.write_parquet(output_dir / "expert_event_list.parquet")
-    expert_events_full.write_parquet(output_dir / "expert_events.parquet")
-    expert_samples.write_parquet(output_dir / "expert_event_samples.parquet")
-    orphan_events.write_parquet(output_dir / "orphan_events.parquet")
-    orphan_samples.write_parquet(output_dir / "orphan_event_samples.parquet")
+    print(
+        f"Writing {len(proc)} events, {len(curves)} timesteps to {output_dir} / processed_{prefix}*.parquet"
+    )
+    proc.write_parquet(output_dir / f"processed_{prefix}features.parquet")
+    curves.write_parquet(output_dir / f"processed_{prefix}curves.parquet")
 
 
 def load_public_dataset(path):
@@ -152,12 +116,43 @@ def main():
         / "2019_06_26_to_2024_09_30_Beaver_Creek_DO_saln_BGS_temp_weather.csv"
     )
     dataset = load_full_dataset(DATA_DIR, DATA_GLOB, PUBLIC_DATA)
+    dataset.write_parquet(OUTPUT_DIR / "readouts.parquet")
     # decouple bad-formatting cleanup (-> tidy CSV) from parsing; original xlsx untouched
     reformatted = EVENTS_XLSX.with_name("expert_annotations_reformatted.csv")
     reformat_expert_workbook(EVENTS_XLSX, reformatted)
-    expert_labels = read_expert_event_list(reformatted)
+    expert_event_labels, expert_moment_labels = read_expert_event_list(reformatted)
+    expert_event_labels.write_parquet(OUTPUT_DIR / "expert_event_list.parquet")
+    expert_moment_labels.write_parquet(OUTPUT_DIR / "expert_moment_list.parquet")
 
-    preprocess(dataset, expert_labels, OUTPUT_DIR)
+    _r0, _r1 = dataset["Datetime"].min(), dataset["Datetime"].max()
+    expert_samples = event_samples(
+        dataset,
+        expert_event_labels.with_columns(pl.col("event_id").alias("unit_id"))
+        .sort("start_time")
+        .filter((pl.col("start_time") >= _r0) & (pl.col("start_time") <= _r1)),
+    )
+    expert_samples.write_parquet(OUTPUT_DIR / "expert_samples.parquet")
+    print(
+        f"Writing {len(expert_samples)} sliced events to {OUTPUT_DIR} / expert_samples.parquet"
+    )
+
+    preprocess(
+        dataset,
+        None,
+        expert_event_labels.with_columns(
+            pl.col("event_id").alias("unit_id"), pl.lit("expert").alias("source")
+        ),
+        OUTPUT_DIR,
+        prefix="expert_",
+    )
+    preprocess(dataset, expert_event_labels, None, OUTPUT_DIR, prefix="auto_")
+    preprocess(
+        dataset,
+        expert_event_labels,
+        expert_moment_labels,
+        OUTPUT_DIR,
+        prefix="moments_",
+    )
 
 
 if __name__ == "__main__":

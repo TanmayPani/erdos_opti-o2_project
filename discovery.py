@@ -85,8 +85,8 @@ def _(route):
        the six-year record — the salinization signal behind the transition.
 
     > Toggle **route** above to run on preprocessing.py's augmented **event** table
-    > (`derived/expert_events.parquet`, hot/pulse/mixed) or the **moment** table
-    > (`derived/moment_features.parquet`, each moment typed hot/oxic). **DO-derived —
+    > (`derived/processed_expert_features.parquet`, hot/pulse/mixed) or the **moment** table
+    > (`derived/processed_moments_features.parquet`, each moment typed hot/oxic). **DO-derived —
     > NDA-confidential; keep the rendered outputs on-machine.** The clustering is still
     > label-free; the expert labels are used only as a held-out reference to *score* the
     > unsupervised partitions.
@@ -104,10 +104,10 @@ def disc_input(route):
     # Same engineered features either way (moments have NO hysteresis columns). The 2019
     # public-ESS-DIVE rows are spliced in (is_public_augmented). DO-derived => NDA.
     if route.value == "moments":
-        events = pl.read_parquet("derived/moment_features.parquet")
+        events = pl.read_parquet("derived/processed_moments_features.parquet")
         _LABEL = "label"  # hot / pulse
     else:
-        events = pl.read_parquet("derived/expert_events.parquet")
+        events = pl.read_parquet("derived/processed_expert_features.parquet")
         _LABEL = "expert_label"  # hot / pulse / mixed
 
     # Canonical display class: pulse -> oxic  (hot / oxic [/ mixed]).
@@ -129,7 +129,7 @@ def mutual_information(events):
         "eid",
         "event_id",
         "unit_id",
-        "group_id",
+        "event_id",
         "label_source",
         "regime",
         "split",
@@ -194,7 +194,7 @@ def _():
 def _(events):
     # Hot-moment fraction by year over the record — the salinization narrative.
     drift = (
-        events.with_columns(pl.col("start").dt.year().alias("year"))
+        events.with_columns(pl.col("start_time").dt.year().alias("year"))
         .group_by("year")
         .agg(
             pl.len().alias("n_events"),
@@ -250,7 +250,7 @@ def _():
     k-means partition in PCA space and against any two *real* features, (c) expose the
     physics-grounded **weak-supervision labeling functions** (coverage / conflict /
     learned weight), and (d) profile how the clusters differ feature-by-feature. All of
-    it runs on `derived/expert_events.parquet` (preprocessing.py) — **NDA-derived**.
+    it runs on `derived/processed_expert_features.parquet` (preprocessing.py) — **NDA-derived**.
     """)
     return
 

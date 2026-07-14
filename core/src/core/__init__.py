@@ -1,11 +1,11 @@
-from . import model
+from . import estimator
+from . import nn
 from . import io
 from . import features
-from . import checks
 
 __all__ = [
-    "model",
+    "estimator",
+    "nn",
     "io",
     "features",
-    "checks",
 ]

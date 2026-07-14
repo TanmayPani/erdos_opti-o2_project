@@ -6,6 +6,7 @@ from pathlib import Path
 
 import fastexcel
 import polars as pl
+import polars.selectors as cs
 
 from core.features import DO_COL, WL_COL, SAL_COL, TEMP_COL, PRECIP_COL
 
@@ -507,16 +508,16 @@ def reformat_expert_workbook(src, out_csv):
     # declared-vs-actual count mismatches collected above, plus the window/type integrity flaws
     # found by re-auditing the healed parser output (reversed/overlapping/out-of-window/untyped
     # moments). One event_id per line, sorted; overwritten each run; empty file if all clean.
-    flaws = _audit_flaws(read_expert_event_list(out_csv))
-    for _eid in count_mismatch:
-        flaws.setdefault(_eid, set()).add("count_mismatch")
-    out_csv.with_name("inconsistent-ids.txt").write_text(
-        "".join(f"{eid}\n" for eid in sorted(flaws))
-    )
+    # flaws = _audit_flaws(read_expert_event_list(out_csv))
+    # for _eid in count_mismatch:
+    #    flaws.setdefault(_eid, set()).add("count_mismatch")
+    # out_csv.with_name("inconsistent-ids.txt").write_text(
+    #    "".join(f"{eid}\n" for eid in sorted(flaws))
+    # )
     return out_csv
 
 
-def read_expert_event_list(key):
+def read_expert_event_list(path):
     """Parse the TIDY reformatted event CSV (`reformat_expert_workbook`'s output — one row per
     moment, umbrella scalars repeated, a `type` of `umbrella`/`hot`/`oxic`) into one row per TOP-LEVEL event
     (umbrella) with nested `moments.*` list columns. This is the *real* parser: it assumes a
@@ -533,144 +534,36 @@ def read_expert_event_list(key):
     `duration_min`/`min_to_rise`/`min_to_infl`/`min_to_fall`. Aggregate up via
     `core.features.agg_expert_moment` /
     `core.features.enrich_expert_events`."""
-    raw = pl.read_csv(key, infer_schema_length=0, null_values=[""])
+    raw = pl.read_csv(path, infer_schema_length=0, null_values=[""]).with_columns(
+        pl.col("year").cast(pl.Int64, strict=False),
+        pl.col("moment_idx").cast(pl.Int64, strict=False),
+        pl.col("start_time").str.to_datetime(_DT_FMT, strict=False),
+        pl.col("end_time").str.to_datetime(_DT_FMT, strict=False),
+        pl.col("n_hot_moments").cast(pl.Int64, strict=False),
+        pl.col("n_oxic_pulses").cast(pl.Int64, strict=False),
+        pl.col("concurrent_precip").cast(pl.Int8, strict=False).cast(pl.Boolean),
+        pl.col("flooding").cast(pl.Int8, strict=False).cast(pl.Boolean),
+        pl.col("xf_qc_checked").cast(pl.Int8, strict=False).cast(pl.Boolean),
+        pl.col("m_peak_do_ts").str.to_datetime(_DT_FMT, strict=False),
+        pl.col("m_do_inflection_ts").str.to_datetime(_DT_FMT, strict=False),
+        pl.col("m_sal_at_peak").cast(pl.Float64, strict=False),
+        pl.col("m_do_rise_pct").cast(pl.Float64, strict=False),
+        pl.col("m_peak_do").cast(pl.Float64, strict=False),
+        pl.col("m_consumption_rate").cast(pl.Float64, strict=False),
+        pl.lit("expert").alias("source"),
+    )
+
+    print(f"{len(raw)} read from {path}...")
+
     # a moment row is any row whose `type` isn't "umbrella" (hot/oxic, or blank if untyped);
     # umbrella scalars come from each event's first row (the umbrella row, written first). The
     # shared `start_time`/`end_time` are aliased back to the stable `group_start`/`group_end`
     # output names downstream expects.
-    _is_mom = pl.col("type").fill_null("_moment_") != "umbrella"
-    _mom = lambda col, alias: pl.col(col).filter(_is_mom).alias(alias)
-    out = raw.group_by("event_id", maintain_order=True).agg(
-        pl.col("year").first(),
-        pl.col("expert_subtype").first(),
-        pl.col("expert_label").first(),
-        pl.col("start_time").first().alias("group_start"),
-        pl.col("end_time").first().alias("group_end"),
-        pl.col("n_hot_moments").first(),
-        pl.col("n_oxic_pulses").first(),
-        pl.col("concurrent_precip").first(),
-        pl.col("flooding").first(),
-        pl.col("notes").first(),
-        pl.col("xf_qc_checked").first(),
-        _mom("moment_idx", "moments.idx"),
-        _mom("type", "moments.type"),
-        _mom("start_time", "moments._begin"),
-        _mom("end_time", "moments._end"),
-        _mom("m_peak_do_ts", "moments._peak_do_ts"),
-        _mom("m_do_inflection_ts", "moments._do_inflection_ts"),
-        _mom("m_sal_at_peak", "moments.sal_at_peak"),
-        _mom("m_do_rise_pct", "moments.do_rise_pct"),
-        _mom("m_peak_do", "moments.peak_do"),
-        _mom("m_consumption_rate", "moments.consumption_rate"),
+    is_umb = pl.col("type").fill_null("_moment_") == "umbrella"
+    events = raw.filter(is_umb).drop(cs.starts_with("m_"))
+    moments = raw.filter(~is_umb).with_columns(
+        unit_id=pl.col("event_id") + "#" + pl.col("moment_idx").cast(pl.String)
     )
 
-    out = out.with_columns(
-        pl.col("year").cast(pl.Int64, strict=False),
-        pl.col("group_start").str.to_datetime(_DT_FMT, strict=False),
-        pl.col("group_end").str.to_datetime(_DT_FMT, strict=False),
-        pl.col("n_hot_moments")
-        .cast(pl.Float64, strict=False)
-        .cast(pl.Int64, strict=False),
-        pl.col("n_oxic_pulses")
-        .cast(pl.Float64, strict=False)
-        .cast(pl.Int64, strict=False),
-        pl.col("concurrent_precip").cast(pl.Int8, strict=False).cast(pl.Boolean),
-        pl.col("flooding").cast(pl.Int8, strict=False).cast(pl.Boolean),
-        pl.col("xf_qc_checked").cast(pl.Int8, strict=False).cast(pl.Boolean),
-        pl.col("moments.idx").list.eval(pl.element().cast(pl.Int64, strict=False)),
-        pl.col("moments.sal_at_peak").list.eval(
-            pl.element().cast(pl.Float64, strict=False)
-        ),
-        pl.col("moments.do_rise_pct").list.eval(
-            pl.element().cast(pl.Float64, strict=False)
-        ),
-        pl.col("moments.peak_do").list.eval(
-            pl.element().cast(pl.Float64, strict=False)
-        ),
-        pl.col("moments.consumption_rate").list.eval(
-            pl.element().cast(pl.Float64, strict=False)
-        ),
-        pl.col("moments._begin")
-        .list.eval(pl.element().str.to_datetime(_DT_FMT, strict=False))
-        .alias("moments.start_time"),
-    )  # .filter(pl.col("expert_label") != "ignore").sort("group_start")
-
-    # heal the timestamp lists against each moment's own start date, then derive durations.
-    # `moments.end_time` is the unified moment end (hot DO-end / oxic end); the hot-only
-    # peak/inflection timings stay null for oxic pulses.
-    out = out.with_columns(
-        _recombine_expr("moments._peak_do_ts", "moments.start_time").alias(
-            "moments.do_peak_time"
-        ),
-        _recombine_expr("moments._do_inflection_ts", "moments.start_time").alias(
-            "moments.do_inflection_time"
-        ),
-        _recombine_expr("moments._end", "moments.start_time").alias("moments.end_time"),
-    ).drop(
-        "moments._begin",
-        "moments._end",
-        "moments._peak_do_ts",
-        "moments._do_inflection_ts",
-    )
-
-    out = out.with_columns(
-        _minutes_between("moments.start_time", "moments.end_time").alias(
-            "moments.duration_min"
-        ),
-        _minutes_between("moments.start_time", "moments.do_peak_time").alias(
-            "moments.min_to_rise"
-        ),
-        _minutes_between("moments.start_time", "moments.do_inflection_time").alias(
-            "moments.min_to_infl"
-        ),
-        _minutes_between("moments.do_peak_time", "moments.end_time").alias(
-            "moments.min_to_fall"
-        ),
-    )
-
-    return out
-
-
-def _audit_flaws(events):
-    """Data-quality flaws in the parsed expert list, for reporting back to Opti-O2. Returns
-    `{event_id: {flaw_tag, ...}}`. Runs on the HEALED parser output (clean datetimes), so a
-    reversed / out-of-window / overlap flag reflects the workbook itself, not the timestamp
-    healing. `count_mismatch` (declared #hot/#oxic vs the moment tally) is added by the caller,
-    which is the only place the workbook's *declared* counts survive."""
-    flaws = {}
-
-    def add(eid, tag):
-        flaws.setdefault(eid, set()).add(tag)
-
-    for row in events.iter_rows(named=True):
-        eid, gs, ge = row["event_id"], row["group_start"], row["group_end"]
-        if gs is None or ge is None:
-            add(eid, "umbrella_window_null")
-        elif ge < gs:
-            add(eid, "umbrella_window_reversed")
-        st, en, pk, ty = (
-            row["moments.start_time"],
-            row["moments.end_time"],
-            row["moments.do_peak_time"],
-            row["moments.type"],
-        )
-        _prev_end = None
-        for i in range(len(st)):
-            if ty[i] is None:
-                add(eid, "untyped_moment")
-            s, e = st[i], en[i]
-            if s is None or e is None:
-                add(eid, "moment_window_null")
-                continue
-            if e < s:
-                add(eid, "moment_window_reversed")
-            if gs is not None and s < gs:
-                add(eid, "moment_before_umbrella")
-            if ge is not None and e > ge:
-                add(eid, "moment_after_umbrella")
-            if pk[i] is not None and not (s <= pk[i] <= e):
-                add(eid, "peak_outside_moment")
-            if _prev_end is not None and s < _prev_end:
-                add(eid, "moments_overlap")
-            _prev_end = e
-    return flaws
+    print(f"{len(events['moment_idx'])} events with {len(moments)} moments detected")
+    return events, moments

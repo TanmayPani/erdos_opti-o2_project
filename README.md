@@ -1,121 +1,123 @@
 # Opti O2
-[proposal](PROPOSAL.md)
 
-An end-to-end, reproducible pipeline that **detects and classifies
-dissolved-oxygen "events"** — *hot moments* (abrupt, tidally-driven) vs *oxic
-pulses* (symmetric, precipitation-driven) — in a 5-minute-cadence environmental
-record from **Beaver Creek, WA** (2019-06-26 → 2024-09-30, ~554k rows):
-dissolved oxygen, salinity, water level, and co-located weather (solar flux, air
-temperature, precipitation, barometric pressure, humidity, …).
+An end-to-end, reproducible pipeline that **detects and classifies dissolved-oxygen
+excursions** at **Beaver Creek, WA** — *hot moments* (abrupt, tidally / saline-intrusion
+driven) vs *oxic pulses* (symmetric, freshwater / precipitation driven) — from a
+5-minute-cadence environmental record: dissolved oxygen, salinity, floodplain water level,
+temperature, and co-located weather (solar flux, air temperature, precipitation, barometric
+pressure, humidity, …). A third *mixed* class is held out. The project also forecasts
+excursion **onset** as an early-warning signal.
 
-## Contingency note — labels
+## Data & labels (NDA)
 
-The project's supervised target is Opti O2's **expert event labels**, which are
-**under NDA and not yet delivered**. So that the work stands on its own, the
-pipeline is built and validated entirely on the public ESS-DIVE stand-in, with
-the classifier trained on a **physics-grounded weak-supervision label**
-(`ws_label`) that encodes the published hot-moment vs oxic-pulse taxonomy as
-labeling functions. Everything is driven by a single `LABEL_COL` switch in
-[`modeling.py`](modeling.py): point it at the real expert column on delivery and
-the whole pipeline re-runs unchanged.
+The supervised target is Opti O2's **expert event labels**, delivered as a confidential
+workbook. **These labels and every dissolved-oxygen-derived artifact are under NDA** — they
+are never committed, shared, or sent off-machine. **Git holds code only**; `datasets/` and
+`derived/` are gitignored and copied onto each host by hand.
 
-## The pipeline (three [marimo](https://marimo.io) notebooks)
+For the parts that can stand on their own, the pipeline also reads the **public ESS-DIVE**
+release of the same instrument (2019-06-26 → 2024-09-30), which *is* shareable. The public
+rows are spliced ahead of the delivered series so the record is continuous, with a per-row
+`is_public_augmented` provenance flag.
 
-| Notebook | Role |
+## The pipeline
+
+Data preparation and the CV sweep are **plain scripts**; the analysis surfaces are
+[marimo](https://marimo.io) notebooks. All heavy lifting lives in the **`core`** workspace
+package (`core/src/core/`: `io`, `features`, `estimator`, `nn`).
+
+| Stage | Role |
 |---|---|
-| [`exploratory.py`](exploratory.py) | EDA (multimodality, multi-scale FFT), **event detection**, event-shape + antecedent feature engineering, k-means clusters, and **§4b weak-supervision labels**. Hands off `derived/{events,event_samples}.parquet`. |
-| [`modeling.py`](modeling.py) | **Dual-track classifier** — Track A gradient boosting (XGBoost / CatBoost / Logistic) on engineered features; Track B deep learning (ROCKET / contrastive SSL / InceptionTime / transformer) on raw 5-min sequences — through one leakage-checked CV harness. |
-| [`discovery.py`](discovery.py) | **Unsupervised driver discovery** (label-free): does the taxonomy emerge from the geometry, which drivers carry the class signal, and is the hot-moment fraction drifting over the six-year record. |
+| [`preprocessing.py`](preprocessing.py) | **Plain script.** Parses the raw workbooks + public CSV + expert-event workbook → the `derived/*.parquet` hand-off: `readouts`, `expert_event_list` / `expert_moment_list`, `expert_samples`, and `processed_{auto,expert,moments}_{features,curves}` (24 engineered features + 5-channel raw curves per event). |
+| [`training.py`](training.py) | **Plain script.** The hot/pulse CV sweep through one leakage-checked harness — **Track A** gradient boosting / logistic / TabPFN on engineered features, **Track B** deep learning (ROCKET → boosting/logistic/TabPFN, InceptionTime) on raw 5-min sequences. `--mode excursion` (auto-detected units) or `--mode moment` (expert windows). Writes `derived/model_results*.parquet`. |
+| [`eda.py`](eda.py) | EDA (multimodality, multi-scale FFT), an interactive **event viewer**, the engineered-feature methodology, Cusum driver–response, and event seasonality. |
+| [`modeling.py`](modeling.py) | Reads the CV artifact and renders the model comparison + **SHAP explainability** (one explainer per model family, on both the excursion and moment routes). |
+| [`discovery.py`](discovery.py) | **Label-free driver discovery**: does the taxonomy emerge from the geometry, which drivers carry the class signal, and a physics-rule **weak-supervision** baseline scored against the experts (confusion matrix + Cohen's κ). |
+| [`forecast.py`](forecast.py) | Hourly DO-**magnitude** forecast (DLinear vs PatchTST/PatchTSMixer) and excursion-**onset** early-warning from hydrology + deterministic tidal harmonics. |
+| [`slides.py`](slides.py) | Presentation deck (marimo reveal.js slides) that **reuses** eda's cells. Renders DO-derived data → **keep local, never publish/export off-machine**. |
 
-On the stand-in labels the boosting models reach **macro-F1 ≈ 0.92–0.95,
-Cohen's κ ≈ 0.85–0.90**; shuffling the labels collapses performance to chance
-(≈ 0.51 macro-F1), confirming the harness is leakage-free.
+On grouped cross-validation the tabular models reach **macro-F1 ≈ 0.92, Cohen's κ ≈ 0.85**;
+shuffling the labels collapses performance to chance (≈ 0.44 macro-F1), confirming the
+harness is leakage-free.
 
 ## Prerequisites
 
-- [**uv**](https://docs.astral.sh/uv/) — the package/environment manager this
-  project uses. Install it with:
+- [**uv**](https://docs.astral.sh/uv/) — the package/environment manager this project uses:
 
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
 
-  (or see the [uv install docs](https://docs.astral.sh/uv/getting-started/installation/)
-  for Homebrew/Windows options).
+  (or see the [uv install docs](https://docs.astral.sh/uv/getting-started/installation/) for
+  Homebrew/Windows options).
 
-- **Python 3.14** — you do *not* need to install this yourself; `uv` reads the
-  pinned version from `.python-version` and fetches it automatically.
+- **Python 3.14** — you do *not* need to install this yourself; `uv` reads the pinned version
+  from `.python-version` and fetches it automatically.
 
 ## Getting started
 
-1. **Clone the repository:**
+1. **Clone and install** dependencies into a local `.venv/` (also installs the `core`
+   workspace package):
 
    ```bash
    git clone <repository-url> opti-o2
    cd opti-o2
-   ```
-
-2. **Install dependencies** into a local virtual environment (`.venv/`):
-
-   ```bash
    uv sync
    ```
 
-   This resolves the exact versions in `uv.lock` (marimo, polars, altair, numpy).
+2. **Provide the data.** `datasets/` and `derived/` are gitignored, so copy them onto the
+   host by hand (see *Data & labels* above). The public ESS-DIVE CSV alone is enough to run
+   the public-standin path.
 
-3. **Launch the notebook** in edit mode:
+3. **Build the `derived/` hand-off** (run from the repo root so relative paths resolve):
 
    ```bash
-   uv run marimo edit exploratory.py
+   uv run python preprocessing.py
    ```
 
-   marimo opens in your browser. Cells are reactive — they re-run automatically
-   when their inputs change. To view it read-only instead, use
-   `uv run marimo run exploratory.py`.
+4. **Run the CV sweep** (optional — needed for `modeling.py`'s comparison panels):
+
+   ```bash
+   uv run python training.py --mode excursion   # or --mode moment
+   ```
+
+5. **Explore the notebooks** — reactive cells re-run automatically when their inputs change:
+
+   ```bash
+   uv run marimo edit eda.py        # or modeling.py / discovery.py / forecast.py
+   ```
+
+   Use `uv run marimo run <notebook>.py` for a read-only view.
 
 ## The dataset
 
-The notebook reads:
+The public loader reads the [ESS-DIVE](https://ess-dive.lbl.gov/) release:
 
 ```
 datasets/BeaverCreekWA_EssDive_26Jun2019-30Sep2024/data/
     2019_06_26_to_2024_09_30_Beaver_Creek_DO_saln_BGS_temp_weather.csv
 ```
 
-a [BagIt](https://en.wikipedia.org/wiki/BagIt)-packaged dataset published on
-[ESS-DIVE](https://ess-dive.lbl.gov/).
-
-If `datasets/` is missing after cloning (large data files may be distributed
-separately), recreate the path above by unzipping the corresponding archive, or
-point the `data_dir_path` in the notebook's `setup` cell at your local copy. The
-loader already handles the file's quirks — spreadsheet `#REF!` artefacts, blank
-rows, a trailing spacer column, and physically impossible sentinel values.
-
-## What's in the notebook
-
-- **Section 1 — Multimodality:** histograms of the cleaned variables. Dissolved
-  oxygen / O₂% are ~92% exact zeros (anoxic well) with a separated oxic mode (a
-  zero-inflated distribution, shown on a symlog count axis); salinity shows
-  several regime peaks.
-- **Section 2 — Multiple time-scales:** daily means over the full record
-  (long-term + seasonal), the average diurnal cycle (mean ± IQR), the seasonal
-  cycle by day of year, and an FFT periodogram of air temperature with annotated
-  diurnal / semi-diurnal / weekly / monthly / annual peaks.
+The confidential loaders (`core.io`) additionally read the delivered NDA workbooks and the
+expert-event workbook when present. The loaders already handle the sources' quirks —
+spreadsheet `#REF!` artefacts, blank rows, a trailing spacer column, banner header rows,
+and the expert workbook's inconsistent moment formatting.
 
 ## Project layout
 
 ```
 opti-o2/
-├── exploratory.py    # EDA + event detection + features + weak-supervision labels
-├── modeling.py       # dual-track event classifier (Track A boosting, Track B deep learning)
-├── discovery.py      # unsupervised driver discovery (label-free)
-├── derived/          # parquet hand-off written by exploratory.py, read by the other two
-├── datasets/         # ESS-DIVE source data
-├── pyproject.toml    # project metadata and dependencies
-├── uv.lock           # pinned, reproducible dependency versions
-└── .python-version   # pinned Python (3.14)
+├── preprocessing.py   # plain script: raw + public + expert workbook → derived/*.parquet
+├── training.py        # plain script: hot/pulse CV sweep (Track A + Track B) → model_results*
+├── eda.py             # EDA + interactive event viewer + feature methodology
+├── modeling.py        # model comparison + SHAP explainability
+├── discovery.py       # label-free driver discovery + weak-supervision baseline
+├── forecast.py        # DO-magnitude forecast + excursion-onset early-warning
+├── slides.py          # reveal.js deck (reuses eda cells; NDA — keep local)
+├── core/              # workspace package: io, features, estimator, nn (ROCKET / InceptionTime …)
+├── derived/           # parquet hand-off written by preprocessing.py (gitignored, NDA)
+├── datasets/          # source data — public ESS-DIVE CSV + NDA workbooks (gitignored)
+├── pyproject.toml     # project metadata and dependencies
+├── uv.lock            # pinned, reproducible dependency versions
+└── .python-version    # pinned Python (3.14)
 ```
-
-The full pipeline (`exploratory.py` → `derived/` → `modeling.py` + `discovery.py`)
-re-runs from a clean kernel in **well under a minute** — so it can be re-run
-verbatim on the Opti O2 NDA dataset the moment it is delivered.
