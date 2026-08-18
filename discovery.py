@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.23.14"
-app = marimo.App(width="full", layout_file="layouts/discovery.slides.json")
+app = marimo.App(width="full")
 
 with app.setup:
     import marimo as mo

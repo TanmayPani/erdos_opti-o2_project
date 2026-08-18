@@ -24,3 +24,6 @@ datasets/
 derived/
 checkpoints/
 cache/
+
+# marimo recreates this whenever a non-default view is saved in the editor
+layouts/

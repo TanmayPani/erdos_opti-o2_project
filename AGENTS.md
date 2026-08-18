@@ -125,8 +125,8 @@ parse. The CSV is NDA-derived → gitignored under `datasets/`, regenerated on e
   `exploratory.py`), a **Cusum driver–response** cell (Regier-lab method; water-level rise↑→DO↑,
   air-temp↑→DO↓, matching Regier et al. 2023 Fig. 5) and an **event-seasonality** cell
   (tests that paper's H1: oxic pulses skew to the wet cool season).
-- `slides.py` — the **presentation deck** (marimo **slides layout = reveal.js**,
-  `layout_file="layouts/slides.slides.json"`). A thin wrapper that **reuses eda's named cells**
+- `slides.py` — the **published findings page** (default vertical layout — *not* a slide
+  deck; no `layout_file`). A thin wrapper that **reuses eda's named cells**
   via marimo's `Cell.run`: it owns `event_picker` / `shade_mode` (so the viewer stays
   interactive) and renders `event_detection.run(...)` — no data pipeline is duplicated (`.run()`
   auto-computes the refs from eda). Title slide = a photo background + Erdős / Opti O2 logos,
@@ -152,15 +152,16 @@ parse. The CSV is NDA-derived → gitignored under `datasets/`, regenerated on e
   kernel started `--no-token`** (`marimo edit <nb> --no-token`); a plain `marimo edit` requires a
   token and the tooling can't connect. If two notebooks are open, confirm which port hosts which
   (`discover-servers.sh` + cell inspection) before editing — ports can swap between sessions.
-- **Slides:** the slides layout **is reveal.js** (`layout_file="layouts/*.slides.json"`, cells
-  flagged `{"type":"slide"}`); toggle in the editor's View → Slides, or `marimo export pdf …
-  --as=slides`. A cell must be **named** (not `_`) to be importable / reusable via `Cell.run`.
+- **Layouts:** no notebook declares a `layout_file` — all render in the default vertical
+  layout, and `layouts/` is deleted and gitignored. marimo recreates it if you save a
+  non-default view in the editor (View → Slides/Grid); delete it again or leave it ignored.
+  A cell must be **named** (not `_`) to be importable / reusable via `Cell.run`.
 
 ## Deck publishing (commit builds, push deploys)
 - Managed by **pre-commit** (`.pre-commit-config.yaml`, `pre-commit>=4.6.2` in the venv).
   The `export-slides` hook runs `scripts/export-slides.sh`, which exports `slides.py` →
   `site/index.html` and stages it. Its `files:` regex limits it to commits that stage
-  `slides.py` / `eda.py` / `utils.py` / `core/` / `layouts/slides.slides.json` / `assets/`.
+  `slides.py` / `eda.py` / `utils.py` / `core/` / `assets/` / `scripts/export-slides.sh`.
 - The published page is a **findings page, not a slide deck** — `slides.py` carries no
   `layout_file`. The publish export therefore uses **`--no-include-code`**; marimo's default
   is `--include-code`, which is right for the *validation* command in "Marimo workflow"
@@ -192,5 +193,4 @@ longer 72/168 h lags add little, so Regier et al. 2023's "24 h lag under-credits
 only partly holds at excursion granularity.
 
 ## Safety / NDA
-The Opti O2 NDA data and every DO-derived artifact are confidential — no commits, no sharing,
-no egress. Secrets (TabPFN token) live only in the kernel env / cache, never in committed files.
+The Opti O2 NDA data is confidential — no commits, no sharing, no egress. Secrets (TabPFN token) live only in the kernel env / cache, never in committed files.
