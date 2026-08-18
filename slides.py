@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.23.14"
-app = marimo.App(width="full")
+app = marimo.App(width="full", css_file="assets/theme.css")
 
 with app.setup(hide_code=True):
     import base64
@@ -35,18 +35,55 @@ with app.setup(hide_code=True):
     # imported notebooks set this too; repeated here because this is the rendering kernel.
     _ = alt.renderers.set_embed_options(renderer="svg")
 
+    # Charts sit straight on the page's photo background (assets/theme.css), so they
+    # render on a transparent canvas with light ink. Registered here and not in the
+    # source notebooks: eda / modeling / discovery are also opened on their own, where
+    # the stock light theme is the right one. `alt.theme` is process-global and every
+    # chart is built by a `Cell.run()` that happens after setup, so this reaches them
+    # all. Marks that set their own colour (the confusion-matrix `alt.condition`
+    # labels, say) still win — a theme only fills in what the spec leaves unset.
+    @alt.theme.register("optio2_glass", enable=True)
+    def _optio2_glass() -> alt.theme.ThemeConfig:
+        _ink = "#eef4f7"
+        _muted = "#b3c4cf"
+        _hair = "rgba(255, 255, 255, 0.16)"
+        return {
+            "config": {
+                "background": "transparent",
+                "view": {"stroke": "transparent"},
+                "title": {"color": _ink, "subtitleColor": _muted},
+                "axis": {
+                    "labelColor": _muted,
+                    "titleColor": _ink,
+                    "gridColor": "rgba(255, 255, 255, 0.10)",
+                    "domainColor": _hair,
+                    "tickColor": _hair,
+                },
+                "legend": {"labelColor": _muted, "titleColor": _ink},
+                "header": {"labelColor": _ink, "titleColor": _ink},
+                "text": {"color": _ink},
+            }
+        }
+
+
+@app.cell(hide_code=True)
+def page_theme():
+    # assets/theme.css paints the whole page from `--o2-photo`, but a standalone
+    # export has no server to fetch assets/ from at view time — so hand it the photo
+    # here as a base64 data-URI, the same way the title cell embeds the logos.
+    _photo = Path("assets/title_slide_bg.jpg")
+    _rule = ""
+    if _photo.exists():
+        _b64 = base64.b64encode(_photo.read_bytes()).decode()
+        _rule = f":root {{ --o2-photo: url(data:image/jpeg;base64,{_b64}); }}"
+    mo.Html(f"<style>{_rule}</style>")
+    return
+
 
 @app.cell(hide_code=True)
 def title():
-    _photo = Path("assets/title_slide_bg.jpg")
-    _mime = {"jpg": "jpeg", "png": "png", "webp": "webp"}.get(
-        _photo.suffix.lower().lstrip("."), "jpeg"
-    )
-    _layer = (
-        f", url(data:image/{_mime};base64,{base64.b64encode(_photo.read_bytes()).decode()})"
-        if _photo.exists()
-        else ""
-    )
+    # The photo is now the whole page's background (see `page_theme`), so the title
+    # card no longer carries its own copy — it is just a darker pane of glass over it.
     _title1 = "Tidal Hiccups and Oxic Sighs : Machine Learning Meets Marshland Respiration"
     _title2 = (
         "Formalizing Classification Methodologies for Environmental Drivers of Dissolved Oxygen"
@@ -90,8 +127,9 @@ def title():
         f"""
     <div style="
         position: relative;
-        background-image: linear-gradient(rgba(12,20,28,0.62), rgba(12,20,28,0.62)){_layer};
-        background-size: cover; background-position: center; border-radius: 14px;
+        background: linear-gradient(rgba(8,15,22,0.30), rgba(8,15,22,0.62));
+        backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+        border: 1px solid rgba(255,255,255,0.10); border-radius: 14px;
         padding: 4.5rem 3.5rem; min-height: 460px; display: flex;
         flex-direction: column; justify-content: center; color: #fff;">
         <h1 style="margin: 0; color: #fff; font-size: 2.8rem; line-height: 1.1;">

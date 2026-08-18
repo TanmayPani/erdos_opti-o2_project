@@ -11,7 +11,7 @@ set -uo pipefail
 
 EXPORT_TIMEOUT=300   # measured ~20s; 15x headroom, matches AGENTS.md
 
-SOURCES=(slides.py eda.py utils.py core assets scripts/export-slides.sh)
+SOURCES=(slides.py eda.py utils.py core assets pyproject.toml scripts/export-slides.sh)
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 

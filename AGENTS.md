@@ -68,6 +68,25 @@ flag; xlsxwriter/openpyxl aren't installed so it's CSV via the stdlib `csv` modu
 nested `moments.*` lists (now incl. `moments.type`). `preprocessing.py` runs the reformat then the
 parse. The CSV is NDA-derived → gitignored under `datasets/`, regenerated on each run.
 
+**Stray hot-block timings (healed in `read_expert_event_list`).** The workbook's "Time of Peak
+DO" (col E) and "Time of DO Inflection Point" (col F) columns sometimes hold something that is
+not a timestamp of that moment. The dominant case is a `=end-start` **duration formula** left in
+the peak column with the `[h]:mm` elapsed-time number format — every xlsx reader treats that
+format as a time and converts the bare day-fraction against the 1900 date system, so 2h20m comes
+back as **`1899-12-31 02:20:00`** (13 moments, all oxic/mixed, whose hot block should be empty;
+the value equals the umbrella duration exactly). Three more are plain transcription slips (wrong
+month or year) in the inflection column. None is repairable from the sheet, so anything outside
+its own moment window is **nulled** and the event ids are printed for reporting back to Opti-O2
+(`2019-5o3 2019-7o3 2019-9o3 2020-1o1 2020-3o4 2020-5o5 2020-10o3 2020-13m 2021-1o5 2021-10o1
+2022-6o5 2023-5o5 2024-2o3`; inflection: `2022-1h 2024-4h 2025-1h`). A stray value is worse than a
+missing one: eda's event viewer layers the peak rule on a **shared temporal x scale**, so one
+1899 datum stretched the domain across ~120 years and squeezed the event into a sub-pixel sliver
+— the chart looked blank. `eda.py`'s `_peaks` now also clamps to the plotted window as a second
+guard. No model feature reads these columns (the only consumer is that peak rule), so the
+modelling tables are untouched. Separately, `2022-6o5`'s moment row has `end_time` a day before
+`start_time` — the stray duration (22 h) corroborates the umbrella's end, so the moment row lost
+a day.
+
 ## Notebooks & modules (marimo)
 - `preprocessing.py` — preprocessing pipeline → `derived/proc_features.parquet`
   (tabular, 24 `FEATURE_COLS` incl. an antecedent-precip lag ladder `precip_24h/72h/168h`
@@ -129,10 +148,37 @@ parse. The CSV is NDA-derived → gitignored under `datasets/`, regenerated on e
   deck; no `layout_file`). A thin wrapper that **reuses eda's named cells**
   via marimo's `Cell.run`: it owns `event_picker` / `shade_mode` (so the viewer stays
   interactive) and renders `event_detection.run(...)` — no data pipeline is duplicated (`.run()`
-  auto-computes the refs from eda). Title slide = a photo background + Erdős / Opti O2 logos,
-  each embedded as a runtime data-URI from **`assets/`** (`title_slide_bg.jpg`, `opti_o2_logo.jpg`,
-  `erdos_logo.png`; `beaver_creek_site.jpg` also available). **NDA:** it renders DO-derived data →
+  auto-computes the refs from eda). Title card = Erdős / Opti O2 logos over a glass pane,
+  each embedded as a runtime data-URI from **`assets/`** (`opti_o2_logo.jpg`, `erdos_logo.png`;
+  `beaver_creek_site.jpg` also available). **NDA:** it renders DO-derived data →
   keep local, never `marimo export`/publish. `marimo export pdf slides.py --as=slides` → reveal PDF.
+- **Page theme (glass over the site photo)** — three pieces that must stay in step:
+  (1) **`assets/theme.css`**, wired by `marimo.App(css_file="assets/theme.css")` and inlined into
+  the export's `<head>`: a fixed `body::before` layer painting `--o2-photo` under a dark scrim,
+  `.marimo-cell` / `.output-area` forced transparent, prose text-shadow, and a faint glass panel
+  behind `.vega-embed`. **Two non-obvious rules earn their keep:** `#App` carries tailwind's
+  `bg-background` (an opaque `#181c1a` panel over the whole viewport) and must be forced
+  transparent or the photo never shows; and every content selector is *unscoped* — marimo renders
+  cell output inside `<marimo-mime-renderer>` / `<marimo-tabs>` shadow roots and adopts this
+  stylesheet into them, but an `#App ` ancestor can never match from inside a shadow tree, so a
+  scoped `#App .vega-embed` silently does nothing. **Two more, learned the hard way:**
+  translucent layers compound, so exactly one glass layer per chart (the innermost) — a
+  background on `[role="tabpanel"]` stacked three deep in the SHAP cell, which nests route tabs
+  inside model tabs, and turned it into a near-solid slab; and `modeling.py`'s SHAP panels
+  return `mo.hstack([...])`, i.e. they are **rendered to HTML before `@mo.persistent_cache`
+  stores them**, so their cached spec predates the Altair theme and vega-embed's dark theme
+  paints an opaque `#333` canvas that no Python-side theme can reach (9 of 11 charts were
+  transparent, those 2 were not) — hence `.vega-embed svg.marks { background-color: transparent
+  !important }`, which outranks the inline style and covers any cached-HTML panel. (2) the **`page_theme`** cell in `slides.py`, which sets `--o2-photo` to
+  `assets/title_slide_bg.jpg` as a base64 data-URI — a standalone export can't fetch `assets/` at
+  view time, so the CSS file deliberately ships with `--o2-photo: none` and is filled in at run
+  time. (3) the **`optio2_glass` Altair theme** registered in `slides.py`'s setup cell (transparent
+  canvas, light axis/legend/title ink); it is process-global and every chart is built by a
+  `Cell.run()` *after* setup, so all 62 specs pick it up. Marks with an explicit colour still win.
+  `[tool.marimo.display] theme = "dark"` in `pyproject.toml` pins the app theme (and hence what
+  marimo hands vega-embed) — at the default `"system"` the page would follow each *visitor's* OS
+  setting and light-mode readers would get white chart canvases over the photo, plus modeling.py's
+  white-on-white bar labels. `pyproject.toml` is therefore in the export hook's `SOURCES`.
 - `utils.py` — plotting glue (`hist_chart`/`binned_hist`), `build_forecast_frame`, readout
   globs/constants. The heavy lifting lives in the **`core`** workspace package (`core/src/core/`):
   `core.io` (readout loaders + the expert-event pipeline, `_class3` suffix→class), `core.features`

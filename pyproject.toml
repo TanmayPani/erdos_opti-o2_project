@@ -49,3 +49,10 @@ src = ["core/src"]
 
 [tool.marimo.runtime]
 output_max_bytes = 20_000_000
+
+[tool.marimo.display]
+# The findings page is themed dark (assets/theme.css + slides.py's Altair theme), and
+# the theme is what marimo hands vega-embed. Left at the default "system" the export
+# would follow each *visitor's* OS setting, so a light-mode reader would get white
+# chart canvases — and the white-on-white bar labels in modeling.py — over the photo.
+theme = "dark"

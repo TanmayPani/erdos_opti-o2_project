@@ -203,10 +203,16 @@ def event_detection(
         )
         .select("event_id", "m_no", "m_type", "m_start", "m_end")
     )
+    # Peak-DO rules, clamped to the plotted window. All seven layers share ONE temporal x
+    # scale, so a peak timestamp outside the window would stretch the domain and squeeze the
+    # event into an invisible sliver. `core.io` already nulls out-of-window peaks at the
+    # source; this keeps the viewer safe against any future stray value.
     _peaks = (
         expert_moments.select("event_id", pl.col("m_peak_do_ts").alias("Datetime"))
         .drop_nulls()
-        .join(_covered, on="event_id")
+        .join(_win, on="event_id")
+        .filter(pl.col("Datetime").is_between(pl.col("w0"), pl.col("w1")))
+        .select("event_id", "Datetime")
     )
 
     def _fmt(v, f="{:.2f}"):
@@ -303,10 +309,10 @@ def event_detection(
 
     # --- Dr. Ghosh's multi-axis event format (deck slides 10-14): one panel, four
     # colour-matched y-axes stacked via Axis(offset=...) on layers with independent
-    # y-scales. DO (black, left), precipitation (pink bars, far left), water depth
+    # y-scales. DO (white, left), precipitation (pink bars, far left), water depth
     # below ground (blue, right, axis REVERSED so a rising water table / flood reads
     # as up), salinity (green, far right).
-    _C_DO, _C_PR, _C_WL, _C_SAL = "#111111", "#e377c2", "#1f77b4", "#2ca02c"
+    _C_DO, _C_PR, _C_WL, _C_SAL = "#f0f4f7", "#e377c2", "#1f77b4", "#2ca02c"
 
     def _yaxis(_t, _color, _orient, _offset):
         return alt.Axis(
@@ -462,7 +468,7 @@ def label_survey():
     )
 
     _trend_yr = _trend_yr_bar.transform_regression("year", "hot_fraction").mark_line(
-        color="black", strokeDash=[4, 3]
+        color="#f0f4f7", strokeDash=[4, 3]
     )
 
     _SEASONS = ["Winter (DJF)", "Spring (MAM)", "Summer (JJA)", "Fall (SON)"]
@@ -627,7 +633,7 @@ def record_overview(events, readouts):
         .encode(x=alt.X("mid:T", scale=_xs), y=alt.value(3), text="label:N")
     )
 
-    _C_DO, _C_AIR, _C_SAL, _C_WL = "#111111", "#e6842a", "#2ca02c", "#1f77b4"
+    _C_DO, _C_AIR, _C_SAL, _C_WL = "#f0f4f7", "#e6842a", "#2ca02c", "#1f77b4"
 
     def _yax(_t, _c, _o, _off):
         return alt.Axis(
@@ -675,18 +681,18 @@ def record_overview(events, readouts):
     )
     _bounds = (
         alt.Chart(pl.DataFrame({"b": [_r0, _r1]}))
-        .mark_rule(color="#666", strokeDash=[3, 3])
+        .mark_rule(color="#9aa7b0", strokeDash=[3, 3])
         .encode(x=alt.X("b:T", scale=_xs))
     )
     _gtext = (
         alt.Chart(_gaps)
-        .mark_text(angle=270, color="#444", fontSize=11, fontWeight="bold")
+        .mark_text(angle=270, color="#b3c4cf", fontSize=11, fontWeight="bold")
         .encode(x=alt.X("mid:T", scale=_xs), y=alt.value(180), text="dur:N")
     )
 
     _cap = (
         "**Daily means — all four series on one panel** via the multi-axis trick (real units, "
-        "colour-matched axes): DO (black), air temp (orange), salinity (green), water level "
+        "colour-matched axes): DO (white), air temp (orange), salinity (green), water level "
         "below ground (blue, reversed). Dashed rules mark the readout span; the grey "
         "**end-bands are expert-labelled periods with no readout coverage** — "
     )

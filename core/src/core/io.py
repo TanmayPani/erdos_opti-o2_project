@@ -586,6 +586,40 @@ def read_expert_event_list(path):
 
     print(f"{len(raw)} read from {path}...")
 
+    # The workbook's hot-block timing columns ("Time of Peak DO" / "Time of DO Inflection
+    # Point") sometimes hold something that is not a timestamp of this moment at all. The bulk
+    # of it is one mistake: a `=end-start` DURATION formula left in the peak column, carrying
+    # the `[h]:mm` elapsed-time number format. Every xlsx reader classifies that format as a
+    # time and converts the bare day-fraction against the 1900 date system, so 2h20m comes back
+    # as `1899-12-31 02:20:00` (13 moments, all oxic/mixed — events whose hot block should be
+    # empty). The remainder are transcription slips: a wrong month or year (3 moments).
+    # Neither is repairable from the sheet, and a stray value is worse than a missing one —
+    # eda's event viewer layers the peak rule on a SHARED temporal x scale, so a single 1899
+    # datum stretches the domain across ~120 years and squeezes the real event into a sub-pixel
+    # sliver (the chart looks blank). Anything outside its own moment window becomes null.
+    _has_win = pl.col("start_time").is_not_null() & pl.col("end_time").is_not_null()
+    for _c in ("m_peak_do_ts", "m_do_inflection_ts"):
+        _stray = (
+            _has_win
+            & pl.col(_c).is_not_null()
+            & (
+                (pl.col(_c) < pl.col("start_time"))
+                | (pl.col(_c) > pl.col("end_time"))
+            )
+        )
+        _ids = raw.filter(_stray)["event_id"].unique().sort().to_list()
+        if _ids:
+            print(
+                f"  out-of-window `{_c}` nulled on {len(_ids)} event(s) "
+                f"(report to Opti-O2): {', '.join(_ids)}"
+            )
+        raw = raw.with_columns(
+            pl.when(_stray)
+            .then(pl.lit(None, dtype=pl.Datetime("us")))
+            .otherwise(pl.col(_c))
+            .alias(_c)
+        )
+
     # a moment row is any row whose `type` isn't "umbrella" (hot/oxic, or blank if untyped);
     # umbrella scalars come from each event's first row (the umbrella row, written first). The
     # shared `start_time`/`end_time` are aliased back to the stable `group_start`/`group_end`
