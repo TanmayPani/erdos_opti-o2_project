@@ -1,15 +1,17 @@
 import marimo
 
 __generated_with = "0.23.14"
-app = marimo.App(width="full", layout_file="layouts/slides.slides.json")
+app = marimo.App(width="full")
 
-with app.setup:
+with app.setup(hide_code=True):
     import base64
     from pathlib import Path
+    import altair as alt
     import polars as pl
     import marimo as mo
 
     from utils import feature_methodology_tabs
+    from core.features import MOMENT_FEATURE_COLS
 
     from eda import ui_elements, event_detection, label_survey, feature_methodology
     from modeling import (
@@ -24,8 +26,14 @@ with app.setup:
         disc_ui,
         kmeans_clustering,
         weak_supervision,
-        disc_input,
+        disc_routes,
     )
+
+    # This deck is meant to be shared as a STANDALONE html export (no kernel). Every chart
+    # must render with the Vega SVG renderer: the default <canvas> initialises 0x0 while its
+    # reveal.js slide is off-screen (or its mo.ui.tabs panel inactive) and stays blank. The
+    # imported notebooks set this too; repeated here because this is the rendering kernel.
+    _ = alt.renderers.set_embed_options(renderer="svg")
 
 
 @app.cell(hide_code=True)
@@ -101,15 +109,15 @@ def title():
 
 
 @app.cell(hide_code=True)
-def _():
+def intro():
     mo.vstack(
         [
-            mo.md("""
+            mo.md(r"""
     # Opti O2: Coastal Wetland \( DO_2 \) Dynamics
     """),
             mo.hstack(
                 [
-                    mo.md("""
+                    mo.md(r"""
     * **The Site**: Beaver Creek, WA — a former freshwater floodplain transitioning to a coastal wetland.
     * **The Data**: 6-year, 5-minute resolution time-series of subsurface **Dissolved Oxygen (\(DO_2\))**, **Hydrology** (*Water level*, *Salinity*, etc.), and **Weather** (*Temperature*, *Precipitation*, etc.) timeseries data
     * **The Phenomena**:
@@ -138,13 +146,15 @@ def controls():
 
 
 @app.cell(hide_code=True)
-def _():
+def disc_controls():
+    # These marimo widgets only SEED the initial values of the in-chart Vega controls
+    # (route / k / x axis / y axis are all client-side params now), so they are not
+    # rendered on any slide — a static export has no kernel to drive them.
     _, _defs = disc_ui.run()
     disc_clusters = _defs["num_kmeans_clusters"]
     disc_x_var = _defs["x_var"]
     disc_y_var = _defs["y_var"]
-    disc_route = _defs["route"]
-    return disc_clusters, disc_route, disc_x_var, disc_y_var
+    return disc_clusters, disc_x_var, disc_y_var
 
 
 @app.cell(hide_code=True)
@@ -155,18 +165,25 @@ def viewer(event_picker, shade_mode):
 
 
 @app.cell(hide_code=True)
-def _():
+def feature_examples():
     _moment_features = pl.read_parquet("derived/processed_moments_features.parquet")
     _moment_curves = pl.read_parquet("derived/processed_moments_curves.parquet")
 
-    # _moment_features.head()
-    _tabs = feature_methodology_tabs(_moment_features, _moment_curves)
-    mo.vstack([mo.md("# Engineered Features: Examples"), _tabs])
+    # Moment route: pass MOMENT_FEATURE_COLS so the hysteresis pair (computed & stored for
+    # every route by splice_readouts, but dropped by the moment classifier as degenerate on a
+    # single pulse) is hidden here too — keeping the slide consistent with what we model.
+    _tabs = feature_methodology_tabs(
+        _moment_features,
+        _moment_curves,
+        feature_cols=MOMENT_FEATURE_COLS,
+        example_panel="label_scatter",
+    )
+    mo.vstack([mo.md("# Engineered Features"), _tabs])
     return
 
 
 @app.cell(hide_code=True)
-def _():
+def modelling_intro():
     mo.md(r"""
     # Modelling
 
@@ -176,7 +193,7 @@ def _():
       - **Models**: Linear (*Logistic Regression*), Tree-based (*XGBoost, CatBoost*),  and Deep/Foundation (*TabPFN*).
     *   **Raw Sequences / Time Series**:
       - Evaluates deep learning models directly on the raw 5-minute multivariate time-series waveforms.
-      - **Models**: Sequences transformed by ROCKET, passed on to XGB/CatBoost/Logistic/TabPFN, InceptionTime-Lite (CNN).
+      - **Models**: Time sequences transformed into 20,000 features by ROCKET, passed on to XGB/CatBoost/Logistic/TabPFN, InceptionTime-Lite (CNN).
     *   **Cross Validation**: Evaluated via 5x5 StratifiedGroupKFold and Leave-One-Group-Out (LOGO) cross-validation, holding out expert events from training
     *   **Temporal Generalization**: Includes a 70/30 chronological split to test model robustness against multi-year ecosystem salinization and drift.
     """)
@@ -184,7 +201,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _():
+def label_survey_slide():
     _view, _ = label_survey.run()
     _view
     return
@@ -198,8 +215,8 @@ def slides_metrics_routes():
 
 
 @app.cell(hide_code=True)
-def _(disc_events):
-    _chart, _ = mutual_information.run(events=disc_events)
+def _(disc_events_by_route):
+    _chart, _ = mutual_information.run(events_by_route=disc_events_by_route)
     _, _outs = moment_shap_panel_dict.run()
     _mom_shap = _outs["moment_shap_panels"]
     _mom_shap["Unsupervised"] = _chart
@@ -231,16 +248,26 @@ def _(disc_events):
 
 
 @app.cell(hide_code=True)
-def _(disc_route):
-    _, _defs = disc_input.run(route=disc_route)
-    disc_events = _defs["events"]
-    return (disc_events,)
+def disc_events_cell():
+    # BOTH discovery routes (moments / events). Every downstream slide embeds both and
+    # switches between them client-side, so the route control survives a static export.
+    _, _defs = disc_routes.run()
+    disc_events_by_route = _defs["events_by_route"]
+    return (disc_events_by_route,)
 
 
 @app.cell(hide_code=True)
-def _(disc_clusters, disc_events, disc_x_var, disc_y_var):
+def clustering_slide(
+    disc_clusters,
+    disc_events_by_route,
+    disc_x_var,
+    disc_y_var,
+):
     _view, _ = kmeans_clustering.run(
-        events=disc_events, num_kmeans_clusters=disc_clusters, x_var=disc_x_var, y_var=disc_y_var
+        events_by_route=disc_events_by_route,
+        num_kmeans_clusters=disc_clusters,
+        x_var=disc_x_var,
+        y_var=disc_y_var,
     )
 
     mo.vstack([mo.md("# Unsupervised: Clustering"), _view])
@@ -248,14 +275,14 @@ def _(disc_clusters, disc_events, disc_x_var, disc_y_var):
 
 
 @app.cell(hide_code=True)
-def _(disc_events):
-    _view, _ = weak_supervision.run(events=disc_events)
+def weak_supervision_slide(disc_events_by_route):
+    _view, _ = weak_supervision.run(events_by_route=disc_events_by_route)
     _view
     return
 
 
 @app.cell(hide_code=True)
-def _():
+def conclusions():
     mo.md(r"""
     # Conclusions and Future work
 

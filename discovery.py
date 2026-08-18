@@ -19,9 +19,17 @@ with app.setup:
         confusion_matrix,
     )
 
-    from utils import weak_supervision_labels
+    from utils import (
+        weak_supervision_labels,
+        DISCOVERY_ROUTES,
+        read_discovery_route,
+    )
 
     alt.data_transformers.disable_max_rows()
+    # Vega SVG renderer for every chart here — a default <canvas> initialises 0x0 inside a
+    # hidden mo.ui.tabs panel / off-screen reveal slide and renders blank. marimo merges this
+    # into each chart's usermeta.embedOptions; survives static HTML export. See modeling.py.
+    _ = alt.renderers.set_embed_options(renderer="svg")  # `_ =`: suppress the repr
 
 
 @app.cell
@@ -98,33 +106,35 @@ def _(route):
 
 @app.cell
 def disc_input(route):
-    # Per-event OR per-moment engineered features (toggle `route` in the setup cell).
-    #   events  -> preprocessing.py's augmented per-event table (expert_label hot/pulse/mixed)
-    #   moments -> per-moment table, each moment typed hot / oxic(pulse) individually.
-    # Same engineered features either way (moments have NO hysteresis columns). The 2019
-    # public-ESS-DIVE rows are spliced in (is_public_augmented). DO-derived => NDA.
-    if route.value == "moments":
-        events = pl.read_parquet("derived/processed_moments_features.parquet")
-        _LABEL = "label"  # hot / pulse
-    else:
-        events = pl.read_parquet("derived/processed_expert_features.parquet")
-        _LABEL = "expert_label"  # hot / pulse / mixed
-
-    # Canonical display class: pulse -> oxic  (hot / oxic [/ mixed]).
-    events = events.with_columns(
-        pl.col(_LABEL).replace({"pulse": "oxic"}).alias("class")
-    )
-
+    # The route selected by the marimo radio — drives the *kernel-side* cells below
+    # (the drift monitor). The chart cells that ship in the deck instead consume
+    # `events_by_route` (both routes at once) so their route switch survives a static
+    # HTML export. Same engineered features either way (the moment route's hysteresis
+    # pair is degenerate). 2019 public-ESS-DIVE rows spliced in (is_public_augmented).
+    # DO-derived => NDA.
+    events = read_discovery_route(route.value)
     return events
 
 
 @app.cell
-def mutual_information(events):
+def disc_routes():
+    # BOTH routes, loaded once and keyed by name (moments first = the default). Cells that
+    # render into slides.py take this instead of a single `events` frame: they embed both
+    # routes and let a client-side Vega param / mo.ui.tabs do the switching, so the route
+    # control keeps working with no Python kernel behind it.
+    events_by_route = {_r: read_discovery_route(_r) for _r in DISCOVERY_ROUTES}
+    return (events_by_route,)
+
+
+@app.cell
+def mutual_information(events_by_route):
     # Mutual information between each engineered feature and the event class —
     # a model-free importance that should rank the physically-expected drivers
     # (salinity / water-level step => hot; antecedent precip => pulse) at the top.
     # Engineered features: drop identifiers, labels, provenance flags and the expert-
     # annotated moment aggregates (leaky vs the label). Covers either schema.
+    # Rendered for BOTH routes as mo.ui.tabs — tab switching is client-side, so the
+    # route control still works in a kernel-less static HTML export.
     _drop = {
         "eid",
         "event_id",
@@ -139,6 +149,11 @@ def mutual_information(events):
         "class",
         "start",
         "end",
+        # canonical schema renamed start/end -> start_time/end_time; without these the
+        # raw timestamps get cast to float and rank as top "drivers" (pure leakage via
+        # the multi-year drift in class balance).
+        "start_time",
+        "end_time",
         "n_samples",
         "rise_min",
         "fall_min",
@@ -150,35 +165,38 @@ def mutual_information(events):
         "n_hot_moments",
         "n_oxic_pulses",
     }
-    _FEATURES = [
-        c for c in events.columns if c not in _drop and not c.startswith("moments_")
-    ]
-
-    def _std(cols):
-        _raw = events.select(cols).to_numpy().astype(float)
-        return StandardScaler().fit_transform(
+    def _mi_chart(_events):
+        _FEATURES = [
+            c for c in _events.columns if c not in _drop and not c.startswith("moments_")
+        ]
+        _raw = _events.select(_FEATURES).to_numpy().astype(float)
+        _Xs = StandardScaler().fit_transform(
             SimpleImputer(strategy="median").fit_transform(_raw)
         )
+        # Real reference (hot = 1; 'mixed' counts as non-hot) — used ONLY to score the
+        # label-free partitions, never fed to them.
+        _y_hot = (_events["class"] == "hot").cast(pl.Int8).to_numpy()
+        _mi = mutual_info_classif(_Xs, _y_hot, discrete_features=False, random_state=0)
+        _rank = pl.DataFrame(
+            {"feature": _FEATURES, "mutual_info": [round(float(v), 4) for v in _mi]}
+        ).sort("mutual_info", descending=True)
 
-    _Xs = _std(_FEATURES)
+        return (
+            alt.Chart(_rank.head(14))
+            .mark_bar(color="#3b6fb5")
+            .encode(
+                alt.X("mutual_info:Q", title="mutual information with event class"),
+                alt.Y("feature:N", sort="-x", title=None),
+                tooltip=["feature:N", "mutual_info:Q"],
+            )
+            .properties(
+                width=520,
+                height=360,
+                title="Drivers of the hot-moment vs oxic-pulse distinction",
+            )
+        )
 
-    # Real reference (hot = 1; 'mixed' counts as non-hot) — used ONLY to score the label-free
-    # partitions, never fed to them.
-    _y_hot = (events["class"] == "hot").cast(pl.Int8).to_numpy()
-    _mi = mutual_info_classif(_Xs, _y_hot, discrete_features=False, random_state=0)
-    mi_rank = pl.DataFrame(
-        {"feature": _FEATURES, "mutual_info": [round(float(v), 4) for v in _mi]}
-    ).sort("mutual_info", descending=True)
-
-    alt.Chart(mi_rank.head(14)).mark_bar(color="#3b6fb5").encode(
-        alt.X("mutual_info:Q", title="mutual information with event class"),
-        alt.Y("feature:N", sort="-x", title=None),
-        tooltip=["feature:N", "mutual_info:Q"],
-    ).properties(
-        width=520,
-        height=360,
-        title="Drivers of the hot-moment vs oxic-pulse distinction",
-    )
+    mo.ui.tabs({_r: _mi_chart(_df) for _r, _df in events_by_route.items()})
     return
 
 
@@ -256,14 +274,16 @@ def _():
 
 
 @app.cell
-def kmeans_clustering(events, num_kmeans_clusters, x_var, y_var):
-    # Log-scale skewed magnitudes, standardise, then k-means with the chosen k
-    # (selector above; see the cluster-count diagnostics below the scatter for how
-    # many clusters the geometry supports).
-    # clusters are labelled with plain numerals, numbered by symmetry rank (median
-    # peak_frac) so the numbering is stable across runs.
+def kmeans_clustering(events_by_route, num_kmeans_clusters, x_var, y_var):
+    # Interactive clustering as a SINGLE Altair/Vega spec whose controls (route, k, x-axis,
+    # y-axis) are client-side Vega param bindings — so it stays interactive in a STATIC html
+    # export (no kernel needed). k-means labels for every k in 2..8 are precomputed as columns
+    # (k2..k8); a `binding_select` on k picks the colour field client-side via datum['k'+kSel].
+    # Both routes are clustered SEPARATELY (KMeans/PCA must be fit within a route) and stacked
+    # into one frame with a `route` column that a param-driven transform_filter selects.
+    # The marimo widgets only SEED the initial selections (their .value = default).
+    _ks = list(range(2, 9))
     _logc = ["dur_min", "peak_do", "area_mgLh", "rise_rate", "fall_rate", "precip_24h"]
-    # _logc = ["dur_min", "area_mgLh", "rise_rate", "fall_rate", "precip_24h"]
     _rawc = [
         "peak_frac",
         "sal_in",
@@ -272,198 +292,251 @@ def kmeans_clustering(events, num_kmeans_clusters, x_var, y_var):
         "wl_step",
         "max_rise_norm",
         "plateau_frac",
-        # "hyst_wl",
-        # "hyst_sal",
     ]
-    _X = events.select(
-        [pl.col(c).log1p().alias(c) for c in _logc]
-        + [pl.col(c).fill_null(pl.col(c).median()).alias(c) for c in _rawc]
-    ).to_numpy()
-    _cluster_X = StandardScaler().fit_transform(_X)
 
-    _k = int(num_kmeans_clusters.value)
-    _lab = KMeans(n_clusters=_k, n_init=20, random_state=0).fit_predict(_cluster_X)
-    _pc = PCA(n_components=2, random_state=0).fit_transform(_cluster_X)
+    def _cluster_one(_events, _route):
+        _X = _events.select(
+            [pl.col(c).log1p().alias(c) for c in _logc]
+            + [pl.col(c).fill_null(pl.col(c).median()).alias(c) for c in _rawc]
+        ).to_numpy()
+        _cluster_X = StandardScaler().fit_transform(_X)
+        # PCA depends only on the (fixed) feature set, not on k → compute once per route.
+        _pc = PCA(n_components=2, random_state=0).fit_transform(_cluster_X)
 
-    # rank clusters by median peak_frac: rank 0 = most abrupt (lowest), k-1 = most symmetric
-    _pf = events["peak_frac"].to_numpy()
-    _med = {c: float(np.median(_pf[_lab == c])) for c in range(_k)}
-    _rank_of = {c: r for r, c in enumerate(sorted(_med, key=_med.get))}
-    _ranks = np.array([_rank_of[c] for c in _lab])
+        # One ranked cluster-label column per candidate k (rank 0 = most abrupt = lowest
+        # median peak_frac, so the numbering is stable across k and runs) -> k2..k8.
+        _pf = _events["peak_frac"].to_numpy()
+        _label_cols = {}
+        for _kk in _ks:
+            _lab = KMeans(n_clusters=_kk, n_init=20, random_state=0).fit_predict(
+                _cluster_X
+            )
+            _med = {c: float(np.median(_pf[_lab == c])) for c in range(_kk)}
+            _rank_of = {c: r for r, c in enumerate(sorted(_med, key=_med.get))}
+            _label_cols[f"k{_kk}"] = [f"cluster {_rank_of[c] + 1}" for c in _lab]
 
-    _names = np.array([f"cluster {r + 1}" for r in _ranks])
-    events_clustered = events.with_columns(
-        pl.Series("cluster", _names),
-        pl.Series("cluster_rank", _ranks),
-        pl.Series("is_abrupt", _ranks == 0),
-        pl.Series("pc1", _pc[:, 0]),
-        pl.Series("pc2", _pc[:, 1]),
-    )
-    # Contingency of the label-free k-means cluster (rows) against the expert hot / oxic
-    # typing (cols) — how each cluster splits by true class, plus per-cluster purity.
-    _ct = (
-        events_clustered.group_by(["cluster_rank", "cluster", "class"])
-        .len()
-        .pivot(on="class", index=["cluster_rank", "cluster"], values="len")
-        .fill_null(0)
-        .sort("cluster_rank")
-    )
-    for _cl in ["hot", "oxic"]:
-        if _cl not in _ct.columns:
-            _ct = _ct.with_columns(pl.lit(0, dtype=pl.Int64).alias(_cl))
-    _class_cols = [c for c in _ct.columns if c not in ("cluster_rank", "cluster")]
-    _ordered_class = [c for c in ["hot", "oxic"] if c in _class_cols] + [
-        c for c in _class_cols if c not in ("hot", "oxic")
-    ]
-    cluster_crosstab = (
-        _ct.with_columns(pl.sum_horizontal(_ordered_class).alias("total"))
-        .with_columns(
-            (pl.max_horizontal(_ordered_class) / pl.col("total"))
-            .round(3)
-            .alias("purity")
+        return _events.with_columns(
+            pl.lit(_route).alias("route"),
+            pl.Series("pc1", _pc[:, 0]),
+            pl.Series("pc2", _pc[:, 1]),
+            *[pl.Series(_n, _v) for _n, _v in _label_cols.items()],
         )
-        .select(["cluster", *_ordered_class, "total", "purity"])
+
+    _clustered = pl.concat(
+        [_cluster_one(_df, _r) for _r, _df in events_by_route.items()],
+        how="vertical_relaxed",
     )
 
-    # K-means clusters in PCA space, with a takeaway caption.
-    _chart = (
+    # Axis options (same list as disc_ui), restricted to columns actually present.
+    _axis_opts = [
+        c
+        for c in [
+            "peak_frac",
+            "centroid_frac",
+            "max_rise_norm",
+            "plateau_frac",
+            "sal_step",
+            "wl_step",
+            "temp_step",
+            "precip_24h",
+            "dur_min",
+            "peak_do",
+            "area_mgLh",
+            "rise_rate",
+            "fall_rate",
+            "sal_in",
+            "wl_in",
+            "temp_in",
+        ]
+        if c in _clustered.columns
+    ]
+    # Only the columns the spec actually reads get embedded in the exported HTML.
+    events_clustered = _clustered.select(
+        ["route", "start_time", "class", "pc1", "pc2"]
+        + [f"k{_kk}" for _kk in _ks]
+        + _axis_opts
+    )
+
+    _routes = list(events_by_route)
+    _k_default = min(max(int(num_kmeans_clusters.value), _ks[0]), _ks[-1])
+    _xf_default = x_var.value if x_var.value in _axis_opts else _axis_opts[0]
+    _yf_default = y_var.value if y_var.value in _axis_opts else _axis_opts[1]
+
+    _rSel = alt.param(
+        name="routeSel",
+        value=_routes[0],
+        bind=alt.binding_select(options=_routes, name="route "),
+    )
+    _kSel = alt.param(
+        name="kSel",
+        value=_k_default,
+        bind=alt.binding_select(options=_ks, name="k (clusters) "),
+    )
+    _xfSel = alt.param(
+        name="xf",
+        value=_xf_default,
+        bind=alt.binding_select(options=_axis_opts, name="x axis "),
+    )
+    _yfSel = alt.param(
+        name="yf",
+        value=_yf_default,
+        bind=alt.binding_select(options=_axis_opts, name="y axis "),
+    )
+
+    # Route filter first (both routes are stacked in one frame), then `cluster` = the label
+    # column selected by k — both resolved client-side from the params.
+    _base = (
         alt.Chart(events_clustered)
-        .mark_circle(opacity=0.78)
+        .transform_filter("datum.route === routeSel")
+        .transform_calculate(cluster="datum['k' + kSel]")
+    )
+    _pca = (
+        _base.mark_circle(opacity=0.78)
         .encode(
             alt.X("pc1:Q", title="PC1"),
             alt.Y("pc2:Q", title="PC2"),
             alt.Color(
                 "cluster:N",
-                title=f"k-means cluster (k={_k})",
                 scale=alt.Scale(scheme="set1"),
-                legend=alt.Legend(orient="bottom"),
+                legend=alt.Legend(orient="bottom", title="k-means cluster"),
             ),
             alt.Size(
                 "peak_do:Q", title="peak DO (mg/L)", scale=alt.Scale(range=[25, 400])
             ),
             tooltip=[
-                "start:T",
-                "dur_min:Q",
+                "start_time:T",
                 "peak_do:Q",
                 "peak_frac:Q",
                 "sal_step:Q",
                 "cluster:N",
             ],
         )
-        .properties(
-            width=400, height=300, title=f"Event clusters in PCA space (k = {_k})"
-        )
+        .properties(width=360, height=280, title="Event clusters in PCA space")
     )
-
-    # Cluster separation in the space of two REAL variables (chosen above) rather than the
-    # abstract PCA components: the axes are actual features, so which variables pull the
-    # clusters apart is directly readable. Same colour key as the PCA plot. Reacts to k
-    # and the axis pickers.
-    # Pick which two real (interpretable) variables to use as the scatter axes below.
-
-    _dom = (
-        events_clustered.select("cluster", "cluster_rank")
-        .unique()
-        .sort("cluster_rank")["cluster"]
-        .to_list()
-    )
-    _cscale = alt.Scale(domain=_dom, scheme="set1")
-    _xv, _yv = x_var.value, y_var.value
     _scatter = (
-        alt.Chart(events_clustered)
+        _base.transform_calculate(xval="datum[xf]", yval="datum[yf]")
         .mark_circle(opacity=0.8)
         .encode(
-            alt.X(f"{_xv}:Q", title=_xv),
-            alt.Y(f"{_yv}:Q", title=_yv),
+            alt.X("xval:Q", title="x axis (selector →)"),
+            alt.Y("yval:Q", title="y axis (selector →)"),
             alt.Color(
                 "cluster:N",
-                scale=_cscale,
-                sort=alt.SortField("cluster_rank", order="ascending"),
+                scale=alt.Scale(scheme="set1"),
                 legend=alt.Legend(orient="bottom", title="cluster"),
             ),
             alt.Size(
                 "peak_do:Q", title="peak DO (mg/L)", scale=alt.Scale(range=[30, 400])
             ),
-            tooltip=["start:T", "cluster:N", f"{_xv}:Q", f"{_yv}:Q", "peak_do:Q"],
+            tooltip=["start_time:T", "cluster:N", "xval:Q", "yval:Q", "peak_do:Q"],
         )
-        .properties(width=400, height=300, title=f"Cluster separation: {_yv} vs {_xv}")
+        .properties(width=360, height=280, title="Cluster separation (real features)")
     )
+    # Purity view: per-cluster composition by expert class, normalised — reacts to k as well.
+    _bar = (
+        _base.mark_bar()
+        .encode(
+            alt.X("cluster:N", title="cluster", sort="ascending"),
+            alt.Y("count():Q", title="fraction of cluster", stack="normalize"),
+            alt.Color(
+                "class:N",
+                scale=alt.Scale(
+                        domain=["hot", "oxic", "mixed"],
+                        range=["#c1440e", "#3b7dd8", "#9467bd"],
+                    ),
+                legend=alt.Legend(orient="bottom", title="expert class"),
+            ),
+            tooltip=["cluster:N", "class:N", "count():Q"],
+        )
+        .properties(width=360, height=150, title="Cluster composition (purity)")
+    )
+
+    # resolve_scale independent: the concat otherwise SHARES one colour/size scale across all
+    # three views, so the purity bar's hot/oxic colours get overridden by the scatters' set1
+    # cluster scale. SVG renderer (via usermeta embedOptions): Vega defaults to a <canvas>, which
+    # initialises at 0x0 inside an initially-hidden reveal slide (display:none) and stays blank;
+    # SVG marks lay out correctly when the slide is later shown.
+    _view = (
+        alt.vconcat(
+            alt.hconcat(_pca, _scatter).resolve_scale(
+                color="independent", size="independent"
+            ),
+            _bar,
+        )
+        .resolve_scale(color="independent", size="independent")
+        .add_params(_rSel, _kSel, _xfSel, _yfSel)
+    )
+    _view.usermeta = {"embedOptions": {"renderer": "svg"}}
     mo.vstack(
         [
-            mo.hstack(
-                [
-                    mo.vstack(
-                        [
-                            num_kmeans_clusters,
-                            _chart,
-                        ]
-                    ),
-                    mo.vstack([mo.hstack([x_var, y_var], justify="start"), _scatter]),
-                ],
-                justify="start",
+            _view,
+            mo.md(
+                "*The **route / k / x axis / y axis** dropdowns are in-chart Vega controls, "
+                "so they stay live even in a static HTML export (no Python kernel needed).*"
             ),
-            mo.ui.table(cluster_crosstab, selection=None),
-        ],
-        align="center",
+        ]
     )
     return
 
 
 @app.cell
-def weak_supervision(events):
+def weak_supervision(events_by_route):
     # === Physics-rule labels, cross-checked against the experts ============
-    events_labeled, lf_analysis, lf_weights = weak_supervision_labels(events)
-
-    # Confusion matrix + Cohen's kappa: physics `ws_label` (pulse->oxic) vs the expert
-    # class. The rules only distinguish hot vs oxic, so any 'mixed' events (event route
-    # only) are held out of this 2-class scoring.
+    # Scored for BOTH routes and shown as mo.ui.tabs — tab switching is client-side, so the
+    # route control keeps working in a kernel-less static HTML export.
     _CLS = ["hot", "oxic"]
-    _eval = events_labeled.with_columns(
-        pl.col("ws_label").replace({"pulse": "oxic"}).alias("ws_class")
-    ).filter(pl.col("class").is_in(_CLS))
-    _yt = _eval["class"].to_numpy()
-    _yp = _eval["ws_class"].to_numpy()
-    ws_kappa = float(cohen_kappa_score(_yt, _yp, labels=_CLS))
-    ws_acc = float((_yt == _yp).mean())
-    _cm = confusion_matrix(_yt, _yp, labels=_CLS)
-    ws_confusion = pl.DataFrame(
-        [
-            {"expert": _CLS[_i], "physics": _CLS[_j], "n": int(_cm[_i, _j])}
-            for _i in range(len(_CLS))
-            for _j in range(len(_CLS))
-        ]
-    )
-    _cmax = int(_cm.max()) or 1
-    _heat = (
-        alt.Chart(ws_confusion)
-        .mark_rect()
-        .encode(
-            alt.X("physics:N", title="physics vote (ws_label)", sort=_CLS),
-            alt.Y("expert:N", title="expert label", sort=_CLS),
-            alt.Color("n:Q", scale=alt.Scale(scheme="blues"), legend=None),
+
+    def _ws_confusion_chart(_events):
+        _labeled, _lf_analysis, _lf_weights = weak_supervision_labels(_events)
+
+        # Confusion matrix + Cohen's kappa: physics `ws_label` (pulse->oxic) vs the expert
+        # class. The rules only distinguish hot vs oxic, so any 'mixed' events (event route
+        # only) are held out of this 2-class scoring.
+        _eval = _labeled.with_columns(
+            pl.col("ws_label").replace({"pulse": "oxic"}).alias("ws_class")
+        ).filter(pl.col("class").is_in(_CLS))
+        _yt = _eval["class"].to_numpy()
+        _yp = _eval["ws_class"].to_numpy()
+        _kappa = float(cohen_kappa_score(_yt, _yp, labels=_CLS))
+        _acc = float((_yt == _yp).mean())
+        _cm = confusion_matrix(_yt, _yp, labels=_CLS)
+        _conf = pl.DataFrame(
+            [
+                {"expert": _CLS[_i], "physics": _CLS[_j], "n": int(_cm[_i, _j])}
+                for _i in range(len(_CLS))
+                for _j in range(len(_CLS))
+            ]
         )
-    )
-    _txt = (
-        alt.Chart(ws_confusion)
-        .mark_text(fontSize=26, fontWeight="bold")
-        .encode(
-            alt.X("physics:N", sort=_CLS),
-            alt.Y("expert:N", sort=_CLS),
-            text="n:Q",
-            color=alt.condition(
-                alt.datum.n > _cmax / 2, alt.value("white"), alt.value("#111")
+        _cmax = int(_cm.max()) or 1
+        _heat = (
+            alt.Chart(_conf)
+            .mark_rect()
+            .encode(
+                alt.X("physics:N", title="physics vote (ws_label)", sort=_CLS),
+                alt.Y("expert:N", title="expert label", sort=_CLS),
+                alt.Color("n:Q", scale=alt.Scale(scheme="blues"), legend=None),
+            )
+        )
+        _txt = (
+            alt.Chart(_conf)
+            .mark_text(fontSize=26, fontWeight="bold")
+            .encode(
+                alt.X("physics:N", sort=_CLS),
+                alt.Y("expert:N", sort=_CLS),
+                text="n:Q",
+                color=alt.condition(
+                    alt.datum.n > _cmax / 2, alt.value("white"), alt.value("#111")
+                ),
+            )
+        )
+        return (_heat + _txt).properties(
+            width=260,
+            height=260,
+            title=alt.TitleParams(
+                f"Physics rules vs experts  (n={_eval.height})",
+                subtitle=f"Cohen's kappa = {_kappa:.2f}   ·   accuracy = {_acc:.0%}",
+                subtitleFontSize=13,
             ),
         )
-    )
-    _conf_chart = (_heat + _txt).properties(
-        width=260,
-        height=260,
-        title=alt.TitleParams(
-            f"Physics rules vs experts  (n={_eval.height})",
-            subtitle=f"Cohen's kappa = {ws_kappa:.2f}   ·   accuracy = {ws_acc:.0%}",
-            subtitleFontSize=13,
-        ),
-    )
 
     mo.vstack(
         [
@@ -476,15 +549,19 @@ def weak_supervision(events):
                 [
                     mo.md(
                         """
-    - **Labeling functions** vote *hot* / *pulse* / *abstain* using single feature, 
+    - **Labeling functions** vote *hot* / *pulse* / *abstain* using single feature,
     - Accuracy-weighted vote aggregation &rarr; *weak-supervised labels*
     - Taxonomy (Approx.):
         1. Abrupt rise + Slow fall + coincident salinity / water-level step &rarr; **hot moment**
         2. Symmetric curve + Antecedent precipitation &rarr; **oxic pulse**
                         """
                     ),
-                    _conf_chart,
-                    # mo.ui.table(lf_analysis, selection=None),
+                    mo.ui.tabs(
+                        {
+                            _r: _ws_confusion_chart(_df)
+                            for _r, _df in events_by_route.items()
+                        }
+                    ),
                 ],
                 justify="start",
             ),

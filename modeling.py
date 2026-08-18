@@ -47,38 +47,51 @@ with app.setup:
         inception_fn,
         read_tabular_features,
         read_time_series_curves,
+        CV_REPEATS,
     )
 
     warnings.filterwarnings("ignore")
     alt.data_transformers.disable_max_rows()
+
+    # Force the Vega SVG renderer for EVERY chart in this notebook. Vega defaults to a
+    # <canvas>, which initialises 0x0 when its container is hidden (an inactive mo.ui.tabs
+    # panel or an off-screen reveal.js slide) and then renders blank. marimo merges
+    # `alt.renderers.options["embed_options"]` into each chart's `usermeta.embedOptions`
+    # (per-chart `usermeta` still wins), so this one line covers the whole notebook and
+    # survives a static HTML export.
+    _ = alt.renderers.set_embed_options(renderer="svg")  # `_ =`: suppress the repr
 
     LABEL_COL = "label"
 
 
 @app.cell
 def _():
-    _METRIC_ORDER = ["macro_f1", "bal_acc", "roc_auc", "pr_auc", "mcc", "kappa"]
+    # MCC / Cohen's kappa are still computed by training.py and live in the results parquet,
+    # but are intentionally omitted from _METRIC_ORDER so they are not reported as tabs.
+    _METRIC_ORDER = ["macro_f1", "bal_acc", "roc_auc", "pr_auc"]
     _METRIC_LABEL = {
         "macro_f1": "F1-score",
         "bal_acc": "Balanced Acc.",
         "roc_auc": "ROC-AUC",
         "pr_auc": "PR-AUC",
-        "mcc": "Matthew's Corr.",
-        "kappa": "Cohen\u2019s \u03ba",
     }
-    _METRIC_CHANCE = {
-        "macro_f1": 0.5,
-        "bal_acc": 0.5,
-        "roc_auc": 0.5,
-        "mcc": 0.0,
-        "kappa": 0.0,
-    }
+    def _metric_chance(n_classes=2):
+        """Dashed chance reference per metric, for an `n_classes`-way problem. Balanced
+        accuracy and macro-F1 under uniform guessing are both 1/n (0.5 binary, 0.333 for the
+        3-class hot/pulse/mixed target); one-vs-rest macro ROC-AUC is 0.5 for any n. PR-AUC's
+        chance level is the class prevalence, which differs per class, so it gets no line."""
+        return {
+            "macro_f1": 1 / n_classes,
+            "bal_acc": 1 / n_classes,
+            "roc_auc": 0.5,
+        }
 
-    def metric_bar_tabs(frame, table, sort="macro_f1", height=300):
+    def metric_bar_tabs(frame, table, sort="macro_f1", height=300, n_classes=2):
         """Per-table metric reporting as bar charts (models on x, one tab per metric),
         reading the tidy `model_results` frame [table, model, metric, mean, std]. Bars carry
         +/-std whiskers where present and a dashed chance reference (0.5 for F1 / bal-acc /
         ROC-AUC, 0 for MCC / kappa). Model order is shared across tabs (ranked by `sort`)."""
+        _CHANCE = _metric_chance(n_classes)
         sub = frame.filter(pl.col("table") == table)
         if sub.height == 0:
             return mo.md(f"> no rows for table `{table}`.")
@@ -131,9 +144,9 @@ def _():
                 color="white",
             ).encode(y="mean:Q", text=alt.Text("mean:Q", format=".2f"))
             layers = [bars, whisker, labels]
-            if m in _METRIC_CHANCE:
+            if m in _CHANCE:
                 layers.append(
-                    alt.Chart(pl.DataFrame({"y": [_METRIC_CHANCE[m]]}))
+                    alt.Chart(pl.DataFrame({"y": [_CHANCE[m]]}))
                     .mark_rule(color="#c1440e", strokeDash=[4, 3])
                     .encode(y="y:Q")
                 )
@@ -142,12 +155,13 @@ def _():
             )
         return mo.ui.tabs(tabs)
 
-    def metric_bars_grouped(frame, modes, sort="macro_f1", height=340):
+    def metric_bars_grouped(frame, modes, sort="macro_f1", height=340, n_classes=2):
         """Grouped metric bars across evaluation `modes` — models on the x-axis, one bunched
         bar per mode within each model, one tab per metric. `modes` maps a display label ->
         table name in the tidy `model_results` frame; absent tables are skipped. +/-std
         whiskers (white) where present; dashed chance reference. Mode order follows `modes`;
         model order ranks by `sort` on the first mode."""
+        _CHANCE = _metric_chance(n_classes)
         present = {l: t for l, t in modes.items() if t in set(frame["table"].to_list())}
         if not present:
             return mo.md("> no matching tables in `model_results`.")
@@ -204,9 +218,9 @@ def _():
                 y="lo:Q", y2="hi:Q"
             )
             layers = [bars, whisker]
-            if metric in _METRIC_CHANCE:
+            if metric in _CHANCE:
                 layers.append(
-                    alt.Chart(pl.DataFrame({"y": [_METRIC_CHANCE[metric]]}))
+                    alt.Chart(pl.DataFrame({"y": [_CHANCE[metric]]}))
                     .mark_rule(color="#c1440e", strokeDash=[4, 3])
                     .encode(y="y:Q")
                 )
@@ -215,11 +229,80 @@ def _():
             )
         return mo.ui.tabs(tabs)
 
-    def metric_bars_routes(frames, table, sort="macro_f1", height=340):
+    def _confusion_tab(conf_frames, table):
+        """Per-model PLAIN confusion matrices for one CV `table`, faceted column=model,
+        row=route. `conf_frames` maps a route label -> the tidy confusion frame
+        [table, model, true, pred, count] written by training.py. TRUE label on x, PREDICTED
+        label on y, no normalisation — but the stored counts sum every out-of-fold prediction
+        over all `CV_REPEATS` repeats, so they are divided by `CV_REPEATS` to read on the scale
+        of the dataset (one CV pass = each event held out exactly once; the cells then total
+        138 moments / 86 excursion units). Degrades to a note if the confusion artifact is
+        absent (training.py not yet re-run)."""
+        if not conf_frames:
+            return mo.md(
+                "> **Confusion matrix not computed** — run `.venv/bin/python training.py` "
+                "(and `--mode moment`) to write `derived/model_confusion*.parquet`."
+            )
+        parts = []
+        for route, fr in conf_frames.items():
+            s = fr.filter(pl.col("table") == table)
+            if s.height:
+                parts.append(s.with_columns(pl.lit(route).alias("route")))
+        if not parts:
+            return mo.md(f"> no confusion rows for table `{table}` — re-run `training.py`.")
+        # per-CV-pass counts: undo the summation over repeats (non-integer where a sample
+        # sits near a decision boundary and flips between repeats — that spread is real).
+        d = pl.concat(parts).with_columns(
+            (pl.col("count") / CV_REPEATS).alias("count")
+        )
+        _classes = sorted(d["true"].unique().to_list())
+        _models = d["model"].unique(maintain_order=True).to_list()
+        # Row order: moment route on TOP, excursion on BOTTOM (then any others), so both routes
+        # are always shown when their confusion artifacts exist.
+        _present = set(d["route"].to_list())
+        _routes = [r for r in ("moment", "excursion") if r in _present] + [
+            r for r in conf_frames if r in _present and r not in ("moment", "excursion")
+        ]
+        _cmax = float(d["count"].max() or 1)  # text flips to white on the dark (high-count) cells
+        _rect = alt.Chart().mark_rect().encode(
+            x=alt.X("true:N", title="true label", sort=_classes),
+            y=alt.Y("pred:N", title="predicted label", sort=_classes),
+            color=alt.Color(
+                "count:Q",
+                title="events per CV pass",
+                scale=alt.Scale(scheme="blues"),
+                legend=alt.Legend(orient="bottom"),
+            ),
+        )
+        _txt = alt.Chart().mark_text(baseline="middle", fontSize=11).encode(
+            x=alt.X("true:N", sort=_classes),
+            y=alt.Y("pred:N", sort=_classes),
+            text=alt.Text("count:Q", format=".1f"),
+            color=alt.condition(
+                f"datum.count > {_cmax * 0.5}", alt.value("white"), alt.value("black")
+            ),
+        )
+        _chart = (
+            alt.layer(_rect, _txt, data=d)
+            .properties(width=96, height=96)
+            .facet(
+                column=alt.Column("model:N", sort=_models, title=None),
+                row=alt.Row("route:N", sort=_routes, title=None),
+            )
+        )
+        # SVG renderer: this tab sits inside a hidden mo.ui.tabs panel, so a default canvas can
+        # initialise 0x0 and stay blank until re-rendered — SVG lays out when the tab is shown.
+        _chart.usermeta = {"embedOptions": {"renderer": "svg"}}
+        return _chart
+
+    def metric_bars_routes(
+        frames, table, sort="macro_f1", conf_frames=None, height=340, n_classes=2
+    ):
         """Grouped metric bars comparing classification routes for one CV `table` — models on
         the x-axis, one bunched bar per route within each model, one tab per metric. `frames`
         maps a route label -> its tidy results frame. +/-std whiskers (white); dashed chance
         reference; route order follows `frames`."""
+        _CHANCE = _metric_chance(n_classes)
         parts, route_order = [], []
         for route, fr in frames.items():
             s = fr.filter(pl.col("table") == table)
@@ -277,15 +360,17 @@ def _():
                 y="lo:Q", y2="hi:Q"
             )
             layers = [bars, whisker]
-            if metric in _METRIC_CHANCE:
+            if metric in _CHANCE:
                 layers.append(
-                    alt.Chart(pl.DataFrame({"y": [_METRIC_CHANCE[metric]]}))
+                    alt.Chart(pl.DataFrame({"y": [_CHANCE[metric]]}))
                     .mark_rule(color="#c1440e", strokeDash=[4, 3])
                     .encode(y="y:Q")
                 )
             tabs[_METRIC_LABEL[metric]] = alt.layer(*layers).properties(
                 width=width, height=height
             )
+        if conf_frames is not None:
+            tabs["Confusion Matrix"] = _confusion_tab(conf_frames, table)
         return mo.ui.tabs(tabs)
 
     return metric_bars_grouped, metric_bars_routes
@@ -299,9 +384,29 @@ def rocket_shap_panel(X_rocket, specs, class_names, y):
     reliance by dilation, top-kernel direction beeswarm). Shared by the excursion and
     moment routes — pass that route's kernel `specs` (rocket.module_.kernel_specs(),
     deterministic given the seed) so the cache key stays stable across kernels."""
-    clf = xgb_fn()
+    clf = xgb_fn(n_classes=len(class_names))
     clf.fit(X_rocket, y, sample_weight=compute_sample_weight("balanced", y))
-    sv = shap.TreeExplainer(clf)(X_rocket).values  # (n_rows, 2*n_kernels)
+    sv = shap.TreeExplainer(clf)(X_rocket).values  # (n_rows, 2*n_kernels[, n_classes])
+    # 3-class target -> TreeExplainer returns a per-class axis. Channel/dilation reliance
+    # and the direction beeswarm are all class-specific, so render the WHOLE panel once
+    # per class and tab it, rather than averaging away the thing the panel is showing.
+    if np.asarray(sv).ndim == 3:
+        return mo.ui.tabs(
+            {
+                f"→ {c}": rocket_shap_one(sv[:, :, k], specs, c)
+                for k, c in enumerate(class_names)
+            }
+        )
+    return rocket_shap_one(sv, specs, class_names)
+
+
+@app.function
+def rocket_shap_one(sv, specs, class_names):
+    """One ROCKET SHAP panel for a 2-D `(n_rows, 2*n_kernels)` attribution. `class_names`
+    is either the binary pair (signed axis `class_names[0]` vs `[1]`) or a single class
+    name string (one-vs-rest push toward it)."""
+    _pos = class_names if isinstance(class_names, str) else class_names[1]
+    _neg = f"not {_pos}" if isinstance(class_names, str) else class_names[0]
 
     # map every feature back to its kernel spec (feature 2k -> max, 2k+1 -> ppv of k).
     channels = ["do", "sal", "wl", "temp", "precip"]
@@ -382,7 +487,7 @@ def rocket_shap_panel(X_rocket, specs, class_names, y):
         .mark_circle(size=26, opacity=0.65)
         .encode(
             x=alt.X(
-                "shap:Q", title=f"SHAP value  (◀ {class_names[0]} · {class_names[1]} ▶)"
+                "shap:Q", title=f"SHAP value  (◀ {_neg} · {_pos} ▶)"
             ),
             y=alt.Y("kernel:N", sort=order, title=None),
             yOffset="jitter:Q",
@@ -410,10 +515,17 @@ def shap_feature_panel(X, y, class_names, feature_cols, topk=12):
     """XGBoost + TreeExplainer SHAP for one tabular route → an hstack of (mean-|SHAP|
     bar, per-row beeswarm coloured by feature value). Shared by the excursion and moment
     routes — pass that route's `FEATURE_COLS` / `MOMENT_FEATURE_COLS`. Balanced-weighted
-    full-data fit; read directions, not precise magnitudes, at this small n."""
-    clf = xgb_fn()
+    full-data fit; read directions, not precise magnitudes, at this small n.
+
+    On the 3-class hot/pulse/mixed target TreeExplainer returns `(n, f, K)`; the signed
+    beeswarm has no single axis then, so this hands off to `tabular_shap_charts`, which
+    renders one tab per class. (The binary path keeps its own charts because it also shows
+    the XGBoost gain column alongside mean |SHAP|.)"""
+    clf = xgb_fn(n_classes=len(class_names))
     clf.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
-    sv = shap.TreeExplainer(clf)(X).values  # (n_rows, n_features)
+    sv = shap.TreeExplainer(clf)(X).values  # (n_rows, n_features[, n_classes])
+    if np.asarray(sv).ndim == 3:
+        return tabular_shap_charts(sv, X, feature_cols, class_names, topk)
 
     imp = pl.DataFrame(
         {
@@ -607,6 +719,21 @@ def metrics_routes_plot(
     if model_results_moment is not None:
         _frames["moment"] = model_results_moment
 
+    # Per-route confusion matrices (grouped-CV, from training.py) for the Confusion Matrix tab;
+    # absent files are skipped and the tab shows a "run training.py" note instead.
+    _conf_frames = {}
+    for _route, _cp in [
+        ("excursion", "derived/model_confusion.parquet"),
+        ("moment", "derived/model_confusion_moment.parquet"),
+    ]:
+        if Path(_cp).exists():
+            _conf_frames[_route] = pl.read_parquet(_cp)
+
+    # class count drives the dashed chance line (1/n for macro-F1 / bal-acc); take it from
+    # the confusion frames' distinct true labels, else from the loaded class_names.
+    _n_cls = max(
+        [len(class_names)] + [f["true"].n_unique() for f in _conf_frames.values()]
+    )
     _n_exc = f"{train.height} units / {train['event_id'].n_unique()} umbrellas"
     _mp = pl.read_parquet("derived/processed_moments_features.parquet").filter(
         pl.col("split") == "train"
@@ -622,13 +749,12 @@ def metrics_routes_plot(
     )
     mo.vstack(
         [
-            # mo.md(
-            #    _note + f"**Trainable events:** excursion = {_n_exc}; moment = {_n_mom}. "
-            #    "Both use StratifiedGroupKFold on the umbrella `event_id`, so the moment route "
-            #    "(more, tighter events) and the excursion route (fewer, wider windows) are "
-            #    "graded on the same leakage-safe basis. Bars bunch the two routes per model; "
-            #    "metric = tabs, whiskers = ±std across the 25 grouped-CV folds."
-            # ),
+            mo.md(
+                f"""
+                - **Trainable events:** excursion = {_n_exc}; moment = {_n_mom}. 
+                -  **Over 0.9 F1-score** and accuracy across models and feature modes
+                  """
+            ),
             mo.hstack(
                 [
                     mo.vstack(
@@ -636,7 +762,12 @@ def metrics_routes_plot(
                             mo.md(
                                 "**Engineered features, grouped 5×5 (excursion vs moment):**"
                             ),
-                            metric_bars_routes(_frames, "base_grouped"),
+                            metric_bars_routes(
+                                _frames,
+                                "base_grouped",
+                                conf_frames=_conf_frames,
+                                n_classes=_n_cls,
+                            ),
                         ]
                     ),
                     mo.vstack(
@@ -644,7 +775,12 @@ def metrics_routes_plot(
                             mo.md(
                                 "**ROCKET / InceptionTime on raw curves (excursion vs moment):**"
                             ),
-                            metric_bars_routes(_frames, "dl_grouped"),
+                            metric_bars_routes(
+                                _frames,
+                                "dl_grouped",
+                                conf_frames=_conf_frames,
+                                n_classes=_n_cls,
+                            ),
                         ],
                         # justify="space-around",
                     ),
@@ -695,6 +831,7 @@ def metrics_grouped_plot(metric_bars_grouped, model_results):
                                     "Temporal": "base_temporal",
                                     "Label-shuffled": "base_label_shuffled",
                                 },
+                                n_classes=len(class_names),
                             ),
                         ]
                     ),
@@ -711,6 +848,7 @@ def metrics_grouped_plot(metric_bars_grouped, model_results):
                                     "Label-shuffled": "dl_label_shuffled",
                                     "Time-shuffled": "dl_time_shuffled",
                                 },
+                                n_classes=len(class_names),
                             ),
                         ]
                     ),
@@ -722,10 +860,31 @@ def metrics_grouped_plot(metric_bars_grouped, model_results):
 
 
 @app.function
-def tabular_shap_charts(sv, X, feature_cols, class_names, topk=12):
-    """Shared bar + beeswarm renderer for a tabular SHAP matrix `sv` (n_rows ×
-    n_features, class-1 direction). Mirrors `shap_feature_panel`'s charts so the
-    logistic / TabPFN panels below read side-by-side with the XGBoost one."""
+def tabular_shap_charts(sv, X, feature_cols, class_names, topk=12, axis_title=None):
+    """Shared bar + beeswarm renderer for a tabular SHAP matrix. Mirrors
+    `shap_feature_panel`'s charts so the logistic / TabPFN panels read side-by-side with the
+    XGBoost one.
+
+    `sv` is either 2-D `(n_rows, n_features)` — the binary class-1 direction — or 3-D
+    `(n_rows, n_features, n_classes)` for the 3-class hot/pulse/mixed target, in which case
+    one TAB PER CLASS is returned, each showing that class's one-vs-rest push. SHAP for a
+    K-way model is K separate attributions with no single signed axis to collapse them onto,
+    so tabs rather than an aggregate."""
+    sv = np.asarray(sv)
+    if sv.ndim == 3:
+        return mo.ui.tabs(
+            {
+                f"→ {c}": tabular_shap_charts(
+                    sv[:, :, k],
+                    X,
+                    feature_cols,
+                    class_names,
+                    topk,
+                    axis_title=f"SHAP value  (◀ not {c} · {c} ▶)",
+                )
+                for k, c in enumerate(class_names)
+            }
+        )
     Xa = np.asarray(X, dtype=float)
     cols = list(feature_cols)
     imp = pl.DataFrame(
@@ -771,7 +930,8 @@ def tabular_shap_charts(sv, X, feature_cols, class_names, topk=12):
         .encode(
             x=alt.X(
                 "shap:Q",
-                title=f"SHAP value  (◀ {class_names[0]} · {class_names[1]} ▶)",
+                title=axis_title
+                or f"SHAP value  (◀ {class_names[0]} · {class_names[1]} ▶)",
             ),
             y=alt.Y("feature:N", sort=top, title=None),
             yOffset="jitter:Q",
@@ -801,19 +961,30 @@ def tabular_shap_charts(sv, X, feature_cols, class_names, topk=12):
 @mo.persistent_cache
 def logistic_shap_panel(X, y, class_names, feature_cols, topk=12):
     """Exact SHAP for the torch logistic head via `shap.LinearExplainer`. The skorch net
-    is linear, so in standardized-feature space the class-1 log-odds is
-    (w₁−w₀)·x+(b₁−b₀) and LinearExplainer attributes it per feature. Balanced loss is
-    internal to the net (no sample_weight); read against the XGBoost panel for the
-    additive-only view."""
-    pipe = logreg_fn()
+    is linear, so binary class-1 log-odds is (w₁−w₀)·x+(b₁−b₀) and LinearExplainer
+    attributes it per feature. For the 3-class target the same contrast is taken
+    ONE-VS-REST per class — wₖ minus the mean of the other classes' weights — giving a
+    signed axis per class, stacked into `(n, f, K)` for `tabular_shap_charts` to tab.
+    Balanced loss is internal to the net (no sample_weight); read against the XGBoost
+    panel for the additive-only view."""
+    _nc = len(class_names)
+    pipe = logreg_fn(n_classes=_nc)
     pipe.fit(X, np.asarray(y))
     Xs = pipe[:-1].transform(X)  # median-impute → z-score → float32 (what the net sees)
     _lin = pipe[-1].module_.linear
     _W = _lin.weight.detach().cpu().numpy()
     _b = _lin.bias.detach().cpu().numpy()
-    coef = (_W[1] - _W[0]).astype(float)
-    intercept = float(_b[1] - _b[0])
-    sv = np.asarray(shap.LinearExplainer((coef, intercept), Xs).shap_values(Xs))
+
+    def _ovr(k):
+        _rest = [j for j in range(_nc) if j != k]
+        coef = (_W[k] - _W[_rest].mean(axis=0)).astype(float)
+        intercept = float(_b[k] - _b[_rest].mean())
+        return np.asarray(shap.LinearExplainer((coef, intercept), Xs).shap_values(Xs))
+
+    if _nc == 2:  # keep the exact binary contrast (w₁−w₀), not the OVR mean
+        sv = _ovr(1)
+    else:
+        sv = np.stack([_ovr(k) for k in range(_nc)], axis=-1)
     return tabular_shap_charts(sv, X, feature_cols, class_names, topk)
 
 
@@ -824,8 +995,12 @@ def tabpfn_shap_panel(X, y, class_names, feature_cols, topk=12, budget=128):
     (`tabpfn_extensions.interpretability.shapiq.get_tabpfn_imputation_explainer` —
     shapiq under the hood, imputation-based feature removal) bridged to a
     `shap.Explanation`. TabPFN is a transformer, not a tree, so TreeExplainer can't
-    touch it; `fit_with_cache` + `balance_probabilities` mirror the modelled config,
-    `class_index=1` explains the push toward `class_names[1]`. Slowest explainer cell."""
+    touch it; `fit_with_cache` + `balance_probabilities` mirror the modelled config. The
+    explainer is per-class (`class_index`): binary explains the push toward
+    `class_names[1]`; the 3-class target runs it once per class and stacks the results into
+    `(n, f, K)` so `tabular_shap_charts` tabs them. Slowest explainer cell — and K× slower
+    still on 3 classes."""
+    _nc = len(class_names)
     Xi = SimpleImputer(strategy="median").fit_transform(np.asarray(X, dtype=float))
     clf = TabPFNClassifier(
         fit_mode="fit_with_cache",
@@ -834,15 +1009,23 @@ def tabpfn_shap_panel(X, y, class_names, feature_cols, topk=12, budget=128):
         random_state=0,
     )
     clf.fit(Xi, np.asarray(y))
-    expl = get_tabpfn_imputation_explainer(
-        model=clf, data=Xi, index="SV", max_order=1, class_index=1
+
+    def _for_class(k):
+        expl = get_tabpfn_imputation_explainer(
+            model=clf, data=Xi, index="SV", max_order=1, class_index=k
+        )
+        return np.asarray(
+            shapiq_to_shap_explanation(
+                expl, Xi, budget=budget, feature_names=list(feature_cols)
+            ).values
+        )
+
+    sv = (
+        _for_class(1)
+        if _nc == 2
+        else np.stack([_for_class(k) for k in range(_nc)], axis=-1)
     )
-    se = shapiq_to_shap_explanation(
-        expl, Xi, budget=budget, feature_names=list(feature_cols)
-    )
-    return tabular_shap_charts(
-        np.asarray(se.values), Xi, feature_cols, class_names, topk
-    )
+    return tabular_shap_charts(sv, Xi, feature_cols, class_names, topk)
 
 
 @app.cell(hide_code=True)
@@ -868,108 +1051,131 @@ def _():
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## M-mixed — Where do the held-out *mixed* events fall?
+    ## M-mixed — *mixed* is now a modelled class
 
-    The challenge defines **three** event types (hot / oxic pulse / **mixed**), but with
-    only a handful of mixed umbrellas we model hot-vs-pulse and hold the **mixed (`hx`,
-    "unknown hot moment") + undefined `b`** events out (`split=="holdout"`). Rather than
-    force a third class we cannot learn at this *n*, we ask the binary classifier what it
-    *does* with them: a genuine mixed event — a pulse-shaped DO rise carrying a hot-like
-    **salinity step** — should land near the **hot/pulse decision boundary** (high
-    prediction entropy), not confidently in either camp. That turns the untrained class
-    into evidence that the binary boundary is meaningful.
+    The challenge defines **three** event types (hot / oxic pulse / **mixed**), and as of
+    the **rev 07-31-26** expert workbook we model all three. That revision retired the
+    ambiguous `hx` ("unknown hot moment") and `e` ("oxygen event during flood") codes in
+    favour of an explicit `m`, and gave mixed events their own column block — so a moment's
+    class is now read directly off the block its DO window sits in. Mixed is no longer a
+    handful of umbrellas: it is **39 of 139 moments (24%)** and **13 of 58 events**.
+
+    Earlier revisions had too few mixed umbrellas to learn from, so the deck instead held
+    them out and asked where the *binary* classifier put them — the expectation being that a
+    pulse-shaped DO rise carrying a hot-like **salinity step** should land near the decision
+    boundary rather than confidently in either camp. That argument is **superseded**: the
+    3-class confusion matrix now answers the same question directly, and the only remaining
+    holdout is the orphan excursions (auto-detected, never catalogued by the expert).
     """)
     return
 
 
 @app.cell
 def _(X, class_names, groups, y):
-    _hold = (
-        pl.read_parquet("derived/processed_auto_features.parquet")
-        .filter(pl.col("split") == "holdout")
-        .sort("event_id", "start_time")
-    )
-    _Xh = _hold.select(FEATURE_COLS).to_numpy().astype(float)
-
-    _clf = xgb_fn()
-    _clf.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
-    _ph = _clf.predict_proba(_Xh)[:, 1].astype(
-        float
-    )  # P(pulse) on the unseen held-out events
-
-    # Fair train baseline: out-of-fold P(pulse) from the same grouped CV (never in-sample).
-    _oof = np.full(len(y), np.nan)
-    _sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
-    for _tr, _te in _sgkf.split(np.zeros(len(y)), y, groups):
-        _m = xgb_fn()
-        _m.fit(X[_tr], y[_tr], sample_weight=compute_sample_weight("balanced", y[_tr]))
-        _oof[_te] = _m.predict_proba(X[_te])[:, 1]
-
-    def _entropy(p):
-        p = np.clip(p, 1e-9, 1 - 1e-9)
-        return -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
-
-    _Hh, _Ho = _entropy(_ph), _entropy(_oof)
-
-    # Per-event table for the held-out events (why they are ambiguous: pulse-like rise
-    # + a hot-like salinity step). sal_step / wl_step / rise_rate are the decisive features.
-    mixed_boundary = (
-        _hold.select(["event_id", "expert_subtype", "sal_step", "wl_step", "rise_rate"])
-        .with_columns(
-            p_pulse=pl.Series(_ph).round(3),
-            entropy_bits=pl.Series(_Hh).round(3),
-            prediction=pl.Series(np.where(_ph >= 0.5, class_names[1], class_names[0])),
+    # Wrapped in a local function so the superseded-case early-return is a normal
+    # Python return, not a marimo cell return (a cell's return value is its defined
+    # names, and the cell OUTPUT is its last expression).
+    def _boundary_panel():
+        _hold = (
+            pl.read_parquet("derived/processed_auto_features.parquet")
+            .filter(pl.col("split") == "holdout")
+            .sort("event_id", "start_time")
         )
-        .sort("entropy_bits", descending=True)
-    )
+        # OBSOLETE AS OF THE rev 07-31-26 WORKBOOK. This analysis existed because `mixed` had no
+        # trainable label and was held out; it asked whether the binary boundary "recognised"
+        # those events by leaving them at high entropy. `mixed` is now a first-class target
+        # (core.features.finalize), so the excursion holdout is EMPTY and there is nothing to
+        # score — the 3-class confusion matrix answers the same question directly. Degrades to a
+        # note rather than erroring; the slide narrative above needs rewriting to match.
+        if _hold.height == 0 or len(class_names) != 2:
+            return mo.md(
+                "> **Superseded.** `mixed` is now a trained class rather than a holdout, so the "
+                "held-out boundary analysis no longer applies — see the 3-class confusion "
+                "matrix for how the models actually separate hot / pulse / mixed."
+            )
+        _Xh = _hold.select(FEATURE_COLS).to_numpy().astype(float)
 
-    # Train (OOF) vs held-out entropy distributions
-    _dist = pl.concat(
-        [
-            pl.DataFrame({"entropy_bits": _Ho}).with_columns(
-                set=pl.lit("train (hot/pulse, OOF)")
-            ),
-            pl.DataFrame({"entropy_bits": _Hh}).with_columns(
-                set=pl.lit("held-out (mixed/boundary)")
-            ),
-        ]
-    )
-    _chart = (
-        alt.Chart(_dist)
-        .mark_tick(thickness=2, size=18, opacity=0.7)
-        .encode(
-            x=alt.X(
-                "entropy_bits:Q",
-                title="prediction entropy (bits) — 1.0 = on the boundary",
-                scale=alt.Scale(domain=[0, 1]),
-            ),
-            y=alt.Y("set:N", title=None),
-            color=alt.Color("set:N", legend=None),
-        )
-        .properties(
-            width=460,
-            height=110,
-            title="Mixed events cluster toward the hot/pulse boundary",
-        )
-    )
+        _clf = xgb_fn()
+        _clf.fit(X, y, sample_weight=compute_sample_weight("balanced", y))
+        _ph = _clf.predict_proba(_Xh)[:, 1].astype(
+            float
+        )  # P(pulse) on the unseen held-out events
 
-    _frac_hi = float((_Hh > np.nanmedian(_Ho)).mean())
-    mo.vstack(
-        [
-            mo.md(
-                f"**Held-out mixed/boundary events vs the binary boundary.** Median "
-                f"entropy: **{np.nanmedian(_Ho):.2f} bits** (train, OOF) vs "
-                f"**{np.median(_Hh):.2f} bits** (held-out); **{_frac_hi:.0%}** of the "
-                f"{len(_Hh)} held-out events sit above the train median. With only "
-                f"{len(_Hh)} events this is illustrative, not a statistical test — but it "
-                f"shows mixed events land exactly where hot vs pulse is ambiguous, "
-                f"consistent with their definition (pulse-shaped rise + a hot-like "
-                f"salinity step)."
-            ),
-            _chart,
-            mo.ui.table(mixed_boundary, selection=None),
-        ]
-    )
+        # Fair train baseline: out-of-fold P(pulse) from the same grouped CV (never in-sample).
+        _oof = np.full(len(y), np.nan)
+        _sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
+        for _tr, _te in _sgkf.split(np.zeros(len(y)), y, groups):
+            _m = xgb_fn()
+            _m.fit(X[_tr], y[_tr], sample_weight=compute_sample_weight("balanced", y[_tr]))
+            _oof[_te] = _m.predict_proba(X[_te])[:, 1]
+
+        def _entropy(p):
+            p = np.clip(p, 1e-9, 1 - 1e-9)
+            return -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
+
+        _Hh, _Ho = _entropy(_ph), _entropy(_oof)
+
+        # Per-event table for the held-out events (why they are ambiguous: pulse-like rise
+        # + a hot-like salinity step). sal_step / wl_step / rise_rate are the decisive features.
+        mixed_boundary = (
+            _hold.select(["event_id", "expert_subtype", "sal_step", "wl_step", "rise_rate"])
+            .with_columns(
+                p_pulse=pl.Series(_ph).round(3),
+                entropy_bits=pl.Series(_Hh).round(3),
+                prediction=pl.Series(np.where(_ph >= 0.5, class_names[1], class_names[0])),
+            )
+            .sort("entropy_bits", descending=True)
+        )
+
+        # Train (OOF) vs held-out entropy distributions
+        _dist = pl.concat(
+            [
+                pl.DataFrame({"entropy_bits": _Ho}).with_columns(
+                    set=pl.lit("train (hot/pulse, OOF)")
+                ),
+                pl.DataFrame({"entropy_bits": _Hh}).with_columns(
+                    set=pl.lit("held-out (mixed/boundary)")
+                ),
+            ]
+        )
+        _chart = (
+            alt.Chart(_dist)
+            .mark_tick(thickness=2, size=18, opacity=0.7)
+            .encode(
+                x=alt.X(
+                    "entropy_bits:Q",
+                    title="prediction entropy (bits) — 1.0 = on the boundary",
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                y=alt.Y("set:N", title=None),
+                color=alt.Color("set:N", legend=None),
+            )
+            .properties(
+                width=460,
+                height=110,
+                title="Mixed events cluster toward the hot/pulse boundary",
+            )
+        )
+
+        _frac_hi = float((_Hh > np.nanmedian(_Ho)).mean())
+        return mo.vstack(
+            [
+                mo.md(
+                    f"**Held-out mixed/boundary events vs the binary boundary.** Median "
+                    f"entropy: **{np.nanmedian(_Ho):.2f} bits** (train, OOF) vs "
+                    f"**{np.median(_Hh):.2f} bits** (held-out); **{_frac_hi:.0%}** of the "
+                    f"{len(_Hh)} held-out events sit above the train median. With only "
+                    f"{len(_Hh)} events this is illustrative, not a statistical test — but it "
+                    f"shows mixed events land exactly where hot vs pulse is ambiguous, "
+                    f"consistent with their definition (pulse-shaped rise + a hot-like "
+                    f"salinity step)."
+                ),
+                _chart,
+                mo.ui.table(mixed_boundary, selection=None),
+            ]
+        )
+
+    _boundary_panel()
     return
 
 
@@ -1046,8 +1252,11 @@ def inception_shap_panel(X_seq, y, class_names, max_epochs=120):
     aggregated to per-channel reliance and a per-timestep temporal profile (the sequence
     analogue of the ROCKET channel / dilation view), plus a per-row channel beeswarm.
     Focal loss handles imbalance internally (no sample_weight)."""
+    _nc = len(class_names)
     channels = ["do", "sal", "wl", "temp", "precip"][: X_seq.shape[1]]
-    pipe = inception_fn(n_channels=X_seq.shape[1], max_epochs=max_epochs)
+    pipe = inception_fn(
+        n_channels=X_seq.shape[1], max_epochs=max_epochs, n_classes=_nc
+    )
     pipe.fit(X_seq, np.asarray(y))
     Xsq = pipe[0].transform(X_seq).astype(np.float32)  # channel z-norm, NaN-scrubbed
     module = pipe[-1].module_.eval()
@@ -1059,9 +1268,30 @@ def inception_shap_panel(X_seq, y, class_names, max_epochs=120):
     _sv = shap.GradientExplainer(module, _bg).shap_values(
         torch.tensor(Xsq, device=dev), nsamples=100
     )
-    sv = (
-        _sv[1] if isinstance(_sv, list) else np.asarray(_sv)[..., 1]
-    )  # class 1 → (N,C,T)
+
+    def _logit(k):  # attributions for class k's logit -> (N, C, T)
+        return np.asarray(_sv[k] if isinstance(_sv, list) else np.asarray(_sv)[..., k])
+
+    # 3-class target: every view here (channel reliance, temporal profile, signed push) is
+    # class-specific, so render the whole panel once per class and tab it.
+    if _nc > 2:
+        return mo.ui.tabs(
+            {
+                f"→ {c}": inception_shap_one(_logit(k), Xsq, channels, c)
+                for k, c in enumerate(class_names)
+            }
+        )
+    return inception_shap_one(_logit(1), Xsq, channels, class_names)
+
+
+@app.function
+def inception_shap_one(sv, Xsq, channels, class_names):
+    """One InceptionTime SHAP panel for a `(N, C, T)` attribution `sv`, with `Xsq` the
+    channel-z-normed input it was computed on (used to colour the beeswarm by level).
+    `class_names` is the binary pair (signed axis `[0]` vs `[1]`) or a single class name
+    string (one-vs-rest push toward it)."""
+    _pos = class_names if isinstance(class_names, str) else class_names[1]
+    _neg = f"not {_pos}" if isinstance(class_names, str) else class_names[0]
     sv = np.asarray(sv)
 
     # 1) channel reliance — Σ over time of mean|SHAP| per channel.
@@ -1130,7 +1360,7 @@ def inception_shap_panel(X_seq, y, class_names, max_epochs=120):
         .encode(
             x=alt.X(
                 "shap:Q",
-                title=f"Σ SHAP over time  (◀ {class_names[0]} · {class_names[1]} ▶)",
+                title=f"Σ SHAP over time  (◀ {_neg} · {_pos} ▶)",
             ),
             y=alt.Y("channel:N", sort=_order, title=None),
             yOffset="jitter:Q",

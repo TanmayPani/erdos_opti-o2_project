@@ -26,6 +26,7 @@ from sklearn.metrics import (
     matthews_corrcoef,
     roc_auc_score,
     average_precision_score,
+    confusion_matrix,
 )
 
 from skorch.callbacks import LRScheduler, GradientNormClipping
@@ -52,6 +53,7 @@ MODES = {
         curves="derived/processed_auto_curves.parquet",
         wide="derived/proc_curves_wide.parquet",
         results="derived/model_results.parquet",
+        confusion="derived/model_confusion.parquet",
         feature_cols=FEATURE_COLS,
     ),
     "moment": dict(
@@ -59,6 +61,7 @@ MODES = {
         curves="derived/processed_moments_curves.parquet",
         wide=None,
         results="derived/model_results_moment.parquet",
+        confusion="derived/model_confusion_moment.parquet",
         feature_cols=MOMENT_FEATURE_COLS,
     ),
 }
@@ -82,7 +85,7 @@ def _device():
     )
 
 
-def xgb_fn():
+def xgb_fn(n_classes=2):
     """Shared XGBoost config — shallow trees + L1/L2 against the tiny n. One
     definition for Track A, the ROCKET→XGB heads, and the importance probes."""
     _dev = _device()
@@ -96,15 +99,17 @@ def xgb_fn():
         colsample_bytree=0.8,
         reg_lambda=2.0,
         reg_alpha=0.5,
-        objective="binary:logistic",
-        eval_metric="logloss",
+        # objective/eval_metric follow the class count: the 3-class hot/pulse/mixed
+        # target needs softprob, and "binary:logistic" would silently mis-train on it.
+        objective="binary:logistic" if n_classes == 2 else "multi:softprob",
+        eval_metric="logloss" if n_classes == 2 else "mlogloss",
         # n_jobs=2,
         verbosity=0,
         device=_dev,
     )
 
 
-def catboost_fn():
+def catboost_fn(n_classes=2):
     # GPU (~5 s/fit) only pays off on the wide ROCKET heads (20k features); on the 24-dim
     # tabular track CPU is 0.15 s and GPU would be overhead-bound, so default is CPU.
     _dev_str = _device()
@@ -119,7 +124,7 @@ def catboost_fn():
         depth=4,
         learning_rate=0.05,
         l2_leaf_reg=3.0,
-        loss_function="Logloss",
+        loss_function="Logloss" if n_classes == 2 else "MultiClass",
         verbose=False,
         allow_writing_files=False,
         **_dev,
@@ -148,7 +153,7 @@ def tabpfn_pipeline_fn(rocket=False):
     return make_pipeline(SimpleImputer(strategy="median"), _model)
 
 
-def inception_fn(n_channels=5, max_epochs=120, lr=1e-3, weight_decay=1e-3):
+def inception_fn(n_channels=5, max_epochs=120, lr=1e-3, weight_decay=1e-3, n_classes=2):
     """InceptionTimeLite as an sklearn Pipeline: per-channel train-fold z-norm
     (`ChannelScaler`, the 3-D analogue of `StandardScaler`) → skorch-wrapped net. Consumes
     the raw `(N, C, T)` sequence tensors, so it slots straight into a `model_fn_dict`."""
@@ -170,12 +175,12 @@ def inception_fn(n_channels=5, max_epochs=120, lr=1e-3, weight_decay=1e-3):
             device=_device(),
             verbose=0,
             module__n_channels=n_channels,
-            module__n_classes=2,
+            module__n_classes=n_classes,
         ),
     )
 
 
-def logreg_fn(C=0.5, impute=True):
+def logreg_fn(C=0.5, impute=True, n_classes=2):
     """Torch logistic head as an sklearn Pipeline that MIRRORS
     `LogisticRegression(penalty='l2', C, class_weight='balanced').
     Preprocessing: median-impute the engineered features (ROCKET features are already dense →
@@ -185,7 +190,7 @@ def logreg_fn(C=0.5, impute=True):
     the ROCKET head uses 1.0)."""
     _net = LogisticRegression(
         # module__n_inputs=n_inputs,
-        module__n_outputs=2,
+        module__n_outputs=n_classes,
         criterion=torch.nn.CrossEntropyLoss,
         criterion__reduction="sum",  # Σᵢ, so C·Σ + ½‖W‖² matches sklearn's objective
         optimizer=torch.optim.LBFGS,
@@ -278,8 +283,17 @@ def fit_predict(make_model, Xtr, ytr, Xte):
     return m, pred, proba
 
 
-def grouped_cv(make_model, X, y, labels, groups, n_splits=5, n_repeats=5, seed=0):
+CV_REPEATS = 5  # repeats of the grouped CV; every sample lands in a test fold once per repeat
+
+
+def grouped_cv(make_model, X, y, labels, groups, n_splits=5, n_repeats=CV_REPEATS, seed=0):
+    """Repeated StratifiedGroupKFold. Returns `(metrics, confusion)` where `confusion` is the
+    `labels x labels` count matrix summed over every out-of-fold test set across all repeats
+    (so each sample is counted `n_repeats` times — the modeling notebook divides by
+    `CV_REPEATS` to report per-pass counts). `_cv` keeps the metrics dict and, when given
+    an `extras_out` sink, the confusion — callers that ignore the second element are unaffected."""
     rows = []
+    _yt, _yp = [], []
     for r in range(n_repeats):
         sgkf = StratifiedGroupKFold(
             n_splits=n_splits, shuffle=True, random_state=seed + r
@@ -287,14 +301,18 @@ def grouped_cv(make_model, X, y, labels, groups, n_splits=5, n_repeats=5, seed=0
         for tr, te in sgkf.split(np.zeros(len(y)), y, groups):
             m, pred, proba = fit_predict(make_model, X[tr], y[tr], X[te])
             rows.append(evaluate(y[te], pred, proba, labels))
+            _yt.append(np.asarray(y[te]).ravel())
+            _yp.append(np.asarray(pred).ravel())
     keys = rows[0].keys()
-    return {
+    metrics = {
         k: (
             float(np.mean([r[k] for r in rows if k in r])),
             float(np.std([r[k] for r in rows if k in r])),
         )
         for k in keys
     }
+    conf = confusion_matrix(np.concatenate(_yt), np.concatenate(_yp), labels=labels)
+    return metrics, conf
 
 
 def logo_cv(make_model, X, y, labels, groups):
@@ -363,21 +381,59 @@ def read_time_series_curves(path, map_uid_to_idx, channels=None, num_steps=128):
     return X_raw
 
 
-def _cv(cv_fn, model_fn_dict, X, y, *args, **kwargs):
+def _cv(cv_fn, model_fn_dict, X, y, *args, extras_out=None, **kwargs):
     """Run `cv_fn` for every model factory → `{model_name: {metric: (mean, std)}}`.
     Returns the RAW results dict (not a formatted table) so callers can merge/splice tables.
     A cv_fn may return either a metrics dict or a `(metrics, *extra)` tuple
-    (`temporal_split`); only the metrics dict is kept. Any single model that raises
-    (e.g. TabPFN with no token) is skipped with a warning rather than sinking the run."""
+    (`grouped_cv` → confusion; `temporal_split` → class counts); only the metrics dict is kept.
+    Pass `extras_out` (a dict) to also collect each model's first extra (e.g. `grouped_cv`'s
+    confusion matrix). Any single model that raises (e.g. TabPFN with no token) is skipped with
+    a warning rather than sinking the run."""
     _results = {}
     for name, model_fn in model_fn_dict.items():
         try:
             _res = cv_fn(model_fn, X, y, *args, **kwargs)
-            _results[name] = _res[0] if isinstance(_res, tuple) else _res
+            if isinstance(_res, tuple):
+                _results[name] = _res[0]
+                if extras_out is not None and len(_res) > 1:
+                    extras_out[name] = _res[1]
+            else:
+                _results[name] = _res
             print(f"___[done] {name}")
         except Exception as _e:
             print(f"___[skip] {name}: {type(_e).__name__}: {_e}")
     return _results
+
+
+def confusion_frame(conf_by_model, table, class_names):
+    """Flatten `{model: (n_class, n_class) count array}` into a tidy long frame
+    `[table, model, true, pred, count]` — one row per (true class, predicted class) cell,
+    counts summed over all grouped-CV folds/repeats. The modeling notebook reads this to draw
+    the confusion-matrix tab; an empty `conf_by_model` yields an empty (well-typed) frame."""
+    rows = []
+    for model, cm in conf_by_model.items():
+        cm = np.asarray(cm)
+        for i, tname in enumerate(class_names):
+            for j, pname in enumerate(class_names):
+                rows.append(
+                    {
+                        "table": table,
+                        "model": model,
+                        "true": tname,
+                        "pred": pname,
+                        "count": int(cm[i, j]),
+                    }
+                )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "table": pl.String,
+            "model": pl.String,
+            "true": pl.String,
+            "pred": pl.String,
+            "count": pl.Int64,
+        },
+    )
 
 
 def results_frame(results, table):
@@ -512,20 +568,30 @@ def main(mode="excursion"):
     print("Reading tabular features from:", TABULAR_FEATURES)
     X_tab, y, _class_names, data = read_tabular_features(TABULAR_FEATURES, feature_cols)
 
+    # Every parametric head is built for the ACTUAL class count. The hot/pulse/mixed target
+    # is 3-class as of the rev 07-31-26 workbook; leaving the binary defaults in place made
+    # CatBoost raise ("Logloss ... must contain only 2 unique values") and the torch logistic
+    # head raise on a 3-wide class-weight tensor, silently dropping both from the sweep.
+    # TabPFN infers the class count from `y` itself, so it needs no wiring.
+    _nc = len(_class_names)
     model_fn_dict_base = {
-        "XGBoost": xgb_fn,
-        "CatBoost": catboost_fn,
-        "Logistic (L2)": partial(logreg_fn, C=0.5),
+        "XGBoost": partial(xgb_fn, n_classes=_nc),
+        "CatBoost": partial(catboost_fn, n_classes=_nc),
+        "Logistic (L2)": partial(logreg_fn, C=0.5, n_classes=_nc),
         "TabPFN v3": tabpfn_pipeline_fn,
     }
 
     groups = data["event_id"].to_numpy()
-    class_labels = list(range(len(_class_names)))
+    class_labels = list(range(_nc))
+
+    # Confusion matrices are collected only for the two primary grouped-CV sweeps (Track A/B
+    # real labels); `extras_out` sinks each model's summed out-of-fold confusion matrix.
+    base_conf, dl_conf = {}, {}
 
     print("\n===== engineered features =====")
     _begin("Track A grouped StratifiedGroupKFold (5x5)")
     base_grouped_cv = _cv(
-        grouped_cv, model_fn_dict_base, X_tab, y, class_labels, groups
+        grouped_cv, model_fn_dict_base, X_tab, y, class_labels, groups, extras_out=base_conf
     )
     _report("base_grouped", base_grouped_cv)
 
@@ -561,19 +627,21 @@ def main(mode="excursion"):
     # `RocketTransform` step (via `_rocket_head`), InceptionTime a `ChannelScaler` — so
     # InceptionTime is a first-class `model_fn_dict` entry, no special-casing.
     model_fn_dict_dl = {
-        "ROCKET + XGBoost": partial(rocket_head_pipeline, xgb_fn),
-        "ROCKET + CatBoost": partial(rocket_head_pipeline, catboost_fn),
+        "ROCKET + XGBoost": partial(rocket_head_pipeline, xgb_fn, n_classes=_nc),
+        "ROCKET + CatBoost": partial(rocket_head_pipeline, catboost_fn, n_classes=_nc),
         "ROCKET + Logistic (L2)": partial(
-            rocket_head_pipeline, logreg_fn, C=1.0, impute=False
+            rocket_head_pipeline, logreg_fn, C=1.0, impute=False, n_classes=_nc
         ),
         "ROCKET + TabPFN v3": partial(
             rocket_head_pipeline, tabpfn_pipeline_fn, rocket=True
         ),
-        "InceptionTime-lite": inception_fn,
+        "InceptionTime-lite": partial(inception_fn, n_classes=_nc),
     }
 
     _begin("Track B — ROCKET heads + InceptionTime, tight window (5x5)")
-    dl_grouped_cv = _cv(grouped_cv, model_fn_dict_dl, X_seq, y, class_labels, groups)
+    dl_grouped_cv = _cv(
+        grouped_cv, model_fn_dict_dl, X_seq, y, class_labels, groups, extras_out=dl_conf
+    )
     _report("dl_grouped", dl_grouped_cv)
 
     # Wide 48 h-context variant — optional: only the unit route has `proc_curves_wide.parquet`
@@ -626,6 +694,21 @@ def main(mode="excursion"):
     print(
         f"wrote {RESULTS_PATH} — {out.height} rows over "
         f"{out['table'].n_unique()} tables, {out['model'].n_unique()} models"
+    )
+
+    # Confusion-matrix artifact for the two grouped-CV sweeps (one tidy frame the modeling
+    # notebook renders as a per-model heatmap tab). Written even if partly empty.
+    CONF_PATH = cfg["confusion"]
+    conf_out = pl.concat(
+        [
+            confusion_frame(base_conf, "base_grouped", _class_names),
+            confusion_frame(dl_conf, "dl_grouped", _class_names),
+        ]
+    )
+    conf_out.write_parquet(CONF_PATH)
+    print(
+        f"wrote {CONF_PATH} — {conf_out.height} rows over "
+        f"{conf_out['table'].n_unique()} tables, {conf_out['model'].n_unique()} models"
     )
 
 

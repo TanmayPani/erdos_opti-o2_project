@@ -1,11 +1,9 @@
 from collections import defaultdict
 from typing import Callable
-import re
 from functools import partial
 
 import numpy as np
 import polars as pl
-from scipy.signal import find_peaks
 
 DO_COL = "Dissolved Oxygen (mg/L)"
 SAL_COL = "Well Salinity (PPT)"
@@ -100,14 +98,16 @@ def finalize(features, units):
             pl.lit("train").alias("split"),
         )
         .with_columns(
-            pl.when((pl.col("expert_label") == "mixed") | (pl.col("source") == "orphan"))
+            # `mixed` is a FIRST-CLASS target as of the rev 07-31-26 workbook, which promoted
+            # it from the ambiguous `hx`/`e` codes to an explicit class with its own column
+            # block (39 moments / 13 events — see core.io._MOMENT_BLOCKS). It used to be
+            # nulled and held out; now only ORPHANS (auto-detected excursions with no expert
+            # umbrella, hence no true label at all) stay out of training.
+            pl.when(pl.col("source") == "orphan")
             .then(pl.lit("holdout"))
             .otherwise(pl.lit("train"))
             .alias("split"),
-            pl.when(pl.col("expert_label") == "mixed")
-            .then(None)
-            .otherwise(pl.col("expert_label"))
-            .alias("label"),
+            pl.col("expert_label").alias("label"),
         )
     )
     lead = [

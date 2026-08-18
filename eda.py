@@ -22,6 +22,10 @@ with app.setup:
     from utils import feature_methodology_tabs
 
     alt.data_transformers.disable_max_rows()
+    # Vega SVG renderer for every chart here — a default <canvas> initialises 0x0 inside a
+    # hidden mo.ui.tabs panel / off-screen reveal slide and renders blank. marimo merges this
+    # into each chart's usermeta.embedOptions; survives static HTML export. See modeling.py.
+    _ = alt.renderers.set_embed_options(renderer="svg")  # `_ =`: suppress the repr
 
 
 @app.cell(hide_code=True)
@@ -119,25 +123,90 @@ def event_detection(
     auto_events,
     event_picker,
     events,
-    events_covered,
     expert_events_full,
     expert_moments,
     expert_samples,
-    readouts,
     shade_mode,
 ):
-    _eid = event_picker.value
-    _samples = expert_samples
-    _s = (
-        _samples.filter(pl.col("event_id") == _eid)
-        .sort("Datetime")
+    # Interactive event viewer as a SINGLE Altair/Vega spec: the **event picker** and the
+    # **shading toggle** are client-side Vega param bindings (`eidSel` / `shadeSel`), so the
+    # viewer stays interactive in a STATIC html export with no Python kernel behind it.
+    # Every event's traces, splice segments, moment windows, peak rules and summary card are
+    # embedded once and filtered client-side. The marimo widgets only SEED the defaults.
+    # Only events with readout coverage are offered (the uncovered umbrellas have no series
+    # to plot, so they can't be rendered client-side).
+    # Every event's series has to be embedded at once, so it is bin-downsampled to at most
+    # _NPTS points per event (chart is 720 px wide; events shorter than that keep full 5-min
+    # resolution). Levels are averaged within a bin, precipitation is SUMMED so rainfall
+    # totals survive the reduction. Without this the cell output is ~20 MB and marimo drops
+    # it wholesale (8 MB per-output cap).
+    _NPTS = 300
+    _series = (
+        expert_samples.sort("event_id", "Datetime")
         .select(
+            "event_id",
             "Datetime",
             pl.col("Dissolved Oxygen (mg/L)").alias("do"),
             pl.col("Well Salinity (PPT)").alias("sal"),
             pl.col("Flood plain water level in BGS (cm)").alias("wl"),
             pl.col("Precip (mm) over 5 minutes").alias("precip"),
         )
+        .with_columns(
+            (
+                pl.int_range(pl.len()).over("event_id")
+                * _NPTS
+                // pl.len().over("event_id")
+            ).alias("_bin")
+        )
+        .group_by("event_id", "_bin")
+        .agg(
+            pl.col("Datetime").min(),
+            pl.col("do").mean().round(3),
+            pl.col("sal").mean().round(3),
+            pl.col("wl").mean().round(2),
+            pl.col("precip").sum().round(2),
+        )
+        .sort("event_id", "_bin")
+        .drop("_bin")
+    )
+    _win = _series.group_by("event_id").agg(
+        pl.col("Datetime").min().alias("w0"), pl.col("Datetime").max().alias("w1")
+    )
+    _covered = _win.select("event_id")
+
+    # our detector's auto-events overlapping each window, clipped to it (one row per segment)
+    _splice = (
+        _win.join(auto_events, how="cross")
+        .filter((pl.col("start") <= pl.col("w1")) & (pl.col("end") >= pl.col("w0")))
+        .with_columns(
+            pl.max_horizontal("start", "w0").alias("cstart"),
+            pl.min_horizontal("end", "w1").alias("cend"),
+        )
+        .sort("event_id", "cstart")
+        .with_columns(pl.int_range(1, pl.len() + 1).over("event_id").alias("seg_no"))
+        .select("event_id", "cstart", "cend", "seg_no")
+    )
+    # expert moment windows (empty for orphans), clipped to the plotted window
+    _mrects = (
+        expert_moments.select(
+            "event_id",
+            pl.col("moment_idx").alias("m_no"),
+            pl.col("type").alias("m_type"),
+            pl.col("start_time").alias("m_start"),
+            pl.col("end_time").alias("m_end"),
+        )
+        .drop_nulls(["m_start", "m_end"])
+        .join(_win, on="event_id")
+        .with_columns(
+            pl.max_horizontal("m_start", "w0").alias("m_start"),
+            pl.min_horizontal("m_end", "w1").alias("m_end"),
+        )
+        .select("event_id", "m_no", "m_type", "m_start", "m_end")
+    )
+    _peaks = (
+        expert_moments.select("event_id", pl.col("m_peak_do_ts").alias("Datetime"))
+        .drop_nulls()
+        .join(_covered, on="event_id")
     )
 
     def _fmt(v, f="{:.2f}"):
@@ -147,217 +216,215 @@ def event_detection(
         """
         #Event Detection
 
-        - **Moments (expert-labeled):** Expert detected events based on hydrology (\(DO_2\), flooding, tides, precipitation, etc.) and each event split into distinct hot moments (tidal) and oxic pulses (freshwater).
-        - **Excursions (auto-detected):** Sustained \(DO_2\) departure from anoxic baseline \(DO_2 = 0\) mg/L.
+        - **Moments (expert-labeled):** Expert detected events based on hydrology (\\(DO_2\\), flooding, tides, precipitation, etc.) and each event split into distinct hot moments (tidal) and oxic pulses (freshwater).
+        - **Excursions (auto-detected):** Sustained \\(DO_2\\) departure from anoxic baseline \\(DO_2 = 0\\) mg/L.
         """
     )
 
-    if _s.height == 0:
-        _meta = events.filter(pl.col("event_id") == _eid).to_dicts()[0]
-        _out = mo.vstack(
-            [
-                _event_detection_snip,
-                event_picker,
-                mo.md(
-                    f"""
-            ### {_eid} — expert **{_meta["expert_label"]}** (`{_meta["expert_subtype"]}`)
+    # workbook LEGEND ("hot moment and oxic pulse classification.xlsx") decoded to the
+    # fine suffixes used in the moments list (o1..o5 in the sheet's listed order).
+    _SUBTYPE_MEANING = {
+        "h": "hot moment — tidal DO incursion (water-level rise + salinity step)",
+        "b": "unclassified hot moment (held out)",
+        "hx": "mixed — a symmetric pulse coincident with a salinity step",
+        "e": "oxic event during a flood",
+        "o1": "oxic pulse — no change in salinity",
+        "o2": "oxic pulse — adiabatic change in salinity",
+        "o3": "oxic pulse — prior to flooding",
+        "o4": "oxic pulse — during / following flooding",
+        "o5": "oxic pulse — coincident with rainfall",
+    }
 
-            window **{_meta["start_time"]:%Y-%m-%d %H:%M} → {_meta["end_time"]:%Y-%m-%d %H:%M}**
+    # Per-event summary card, as a tidy [event_id, ord, field, value] frame that a pair of
+    # text marks renders — markdown can't be param-driven, but text marks can.
+    _meta = (
+        expert_events_full.join(_covered, on="event_id")
+        .join(
+            events.select("event_id", "flooding").unique(subset=["event_id"]),
+            on="event_id",
+            how="left",
+        )
+        .join(
+            _splice.group_by("event_id").len().rename({"len": "n_seg"}),
+            on="event_id",
+            how="left",
+        )
+        .sort("start_time")
+    )
+    _card_rows = []
+    for _r in _meta.iter_rows(named=True):
+        _code = _r["expert_subtype"]
+        _fields = [
+            ("event", _r["event_id"]),
+            ("class", f"{_r['expert_label']}  ({_code})"),
+            (
+                "code means",
+                _SUBTYPE_MEANING.get(_code, _SUBTYPE_MEANING.get(_code[:1], "—")),
+            ),
+            (
+                "window",
+                f"{_r['start_time']:%Y-%m-%d %H:%M} → {_r['end_time']:%Y-%m-%d %H:%M}",
+            ),
+            ("duration", f"{_r['dur_min'] / 60:.1f} h"),
+            ("peak DO", f"{_fmt(_r['peak_do'])} mg/L"),
+            ("salinity step", _fmt(_r["sal_step"], "{:+.2f}")),
+            ("water-level step", _fmt(_r["wl_step"], "{:+.2f}")),
+            ("antecedent precip (24 h)", f"{_fmt(_r['precip_24h'], '{:.1f}')} mm"),
+            ("flooding", str(_r["flooding"])),
+            ("DO excursions", f"{_r['n_seg'] or 0} segment(s)"),
+        ]
+        _card_rows += [
+            {"event_id": _r["event_id"], "ord": _i, "field": _k, "value": str(_v)}
+            for _i, (_k, _v) in enumerate(_fields)
+        ]
+    _card_df = pl.DataFrame(_card_rows)
 
-            ⚠ **No readout coverage.** This event falls outside the readout span
-            ({readouts["Datetime"].min():%Y-%m-%d} → {readouts["Datetime"].max():%Y-%m-%d}), so there is **no time series to plot**.
-            """
+    # --- controls as Vega params (kernel-free) -------------------------------------
+    _MODES = ["excursions", "moments"]  # must match ui_elements' shade_mode radio
+    _eids = _meta["event_id"].to_list()
+    _labels = [
+        f"{_r['event_id']}  —  {_r['expert_label']} ({_r['expert_subtype']})"
+        for _r in _meta.iter_rows(named=True)
+    ]
+    _eid_default = event_picker.value if event_picker.value in _eids else _eids[0]
+    _shade_default = shade_mode.value if shade_mode.value in _MODES else _MODES[0]
+
+    _eidSel = alt.param(
+        name="eidSel",
+        value=_eid_default,
+        bind=alt.binding_select(options=_eids, labels=_labels, name="Event "),
+    )
+    _shadeSel = alt.param(
+        name="shadeSel",
+        value=_shade_default,
+        bind=alt.binding_radio(options=_MODES, name="Shade "),
+    )
+    _PICK = "datum.event_id === eidSel"
+
+    # --- Dr. Ghosh's multi-axis event format (deck slides 10-14): one panel, four
+    # colour-matched y-axes stacked via Axis(offset=...) on layers with independent
+    # y-scales. DO (black, left), precipitation (pink bars, far left), water depth
+    # below ground (blue, right, axis REVERSED so a rising water table / flood reads
+    # as up), salinity (green, far right).
+    _C_DO, _C_PR, _C_WL, _C_SAL = "#111111", "#e377c2", "#1f77b4", "#2ca02c"
+
+    def _yaxis(_t, _color, _orient, _offset):
+        return alt.Axis(
+            title=_t,
+            orient=_orient,
+            offset=_offset,
+            titleColor=_color,
+            labelColor=_color,
+            tickColor=_color,
+            domainColor=_color,
+        )
+
+    _bx = (
+        alt.Chart(_series)
+        .transform_filter(_PICK)
+        .encode(x=alt.X("Datetime:T", title="local time"))
+    )
+    _l_pr = _bx.mark_bar(color=_C_PR, size=1.5, opacity=0.6).encode(
+        y=alt.Y(
+            "precip:Q",
+            scale=alt.Scale(zero=True),
+            axis=_yaxis("Precip (mm/5min)", _C_PR, "left", 46),
+        )
+    )
+    _l_wl = _bx.mark_line(color=_C_WL, strokeWidth=1.6).encode(
+        y=alt.Y(
+            "wl:Q",
+            scale=alt.Scale(zero=False, reverse=True),
+            axis=_yaxis("Water depth below ground surface (cm)", _C_WL, "right", 0),
+        )
+    )
+    _l_sal = _bx.mark_line(color=_C_SAL, strokeWidth=1.6).encode(
+        y=alt.Y(
+            "sal:Q",
+            scale=alt.Scale(zero=False),
+            axis=_yaxis("Salinity (PPT)", _C_SAL, "right", 54),
+        )
+    )
+    _l_do = _bx.mark_line(color=_C_DO, strokeWidth=2).encode(
+        y=alt.Y(
+            "do:Q", scale=alt.Scale(zero=True), axis=_yaxis("DO (mg/L)", _C_DO, "left", 0)
+        )
+    )
+    # SHADING (drawn BEHIND the traces) — BOTH variants are embedded and the `shadeSel`
+    # param picks one client-side:
+    #   "excursions" → our detector's segments (one rect per segment);
+    #   "moments"    → the expert moment windows, coloured hot vs oxic.
+    _r_auto = (
+        alt.Chart(_splice)
+        .transform_filter(f"{_PICK} && shadeSel === '{_MODES[0]}'")
+        .mark_rect(opacity=0.14)
+        .encode(
+            x="cstart:T",
+            x2="cend:T",
+            color=alt.Color(
+                "seg_no:N", legend=None, scale=alt.Scale(scheme="category10")
+            ),
+            tooltip=[
+                alt.Tooltip("seg_no:N", title="our event #"),
+                alt.Tooltip("cstart:T", title="start"),
+                alt.Tooltip("cend:T", title="end"),
+            ],
+        )
+    )
+    _r_moments = (
+        alt.Chart(_mrects)
+        .transform_filter(f"{_PICK} && shadeSel === '{_MODES[1]}'")
+        .mark_rect(opacity=0.16)
+        .encode(
+            x="m_start:T",
+            x2="m_end:T",
+            color=alt.Color(
+                "m_type:N",
+                title="moment",
+                scale=alt.Scale(
+                    domain=["hot", "oxic", "mixed"],
+                    range=["#d62728", "#1f77b4", "#9467bd"],
                 ),
-            ]
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("m_no:N", title="moment #"),
+                alt.Tooltip("m_type:N", title="type"),
+                alt.Tooltip("m_start:T", title="start"),
+                alt.Tooltip("m_end:T", title="end"),
+            ],
         )
-    else:
-        _start_t, _end_t = _s["Datetime"][0], _s["Datetime"][-1]
-        # our detector's auto-events overlapping this window, clipped to it (one segment for
-        # an orphan; the splice track for an expert umbrella).
-        _splice = (
-            auto_events.filter(
-                (pl.col("start") <= _end_t) & (pl.col("end") >= _start_t)
-            )
-            .sort("start")
-            .with_row_index("seg")
-            .with_columns(
-                pl.max_horizontal("start", pl.lit(_start_t)).alias("cstart"),
-                pl.min_horizontal("end", pl.lit(_end_t)).alias("cend"),
-                (pl.col("seg") + 1).cast(pl.Int64).alias("seg_no"),
-            )
-        )
+    )
+    _r_pk = (
+        alt.Chart(_peaks)
+        .transform_filter(_PICK)
+        .mark_rule(color="#d62728", strokeDash=[3, 3], opacity=0.55)
+        .encode(x="Datetime:T")
+    )
+    _chart = (
+        alt.layer(_r_auto, _r_moments, _l_pr, _l_wl, _l_sal, _l_do, _r_pk)
+        .resolve_scale(y="independent", color="independent")
+        .properties(width=720, height=440)
+    )
 
-        _row = expert_events_full.filter(pl.col("event_id") == _eid).to_dicts()[0]
-        _title = f"{_eid} — {_row['expert_label']} ({_row['expert_subtype']})"
-        _peaks = (
-            expert_moments.filter(pl.col("event_id") == _eid)
-            .select(pl.col("m_peak_do_ts").alias("Datetime"))  # flat: one row/moment
-            .drop_nulls()
-        )
-        # workbook LEGEND ("hot moment and oxic pulse classification.xlsx") decoded to the
-        # fine suffixes used in the moments list (o1..o5 in the sheet's listed order).
-        _SUBTYPE_MEANING = {
-            "h": "hot moment — tidal DO incursion (water-level rise + salinity step)",
-            "b": "unclassified hot moment (held out)",
-            "hx": "mixed — a symmetric pulse coincident with a salinity step",
-            "e": "oxic event during a flood",
-            "o1": "oxic pulse — no change in salinity",
-            "o2": "oxic pulse — adiabatic change in salinity",
-            "o3": "oxic pulse — prior to flooding",
-            "o4": "oxic pulse — during / following flooding",
-            "o5": "oxic pulse — coincident with rainfall",
-        }
-        _code = _row["expert_subtype"]
-        _code_txt = _SUBTYPE_MEANING.get(_code, _SUBTYPE_MEANING.get(_code[:1], "—"))
-        _details = mo.md(
-            f"""
-            ### {_eid} — **{_row["expert_label"]}** (`{_row["expert_subtype"]}`)
+    # Summary card: two text marks (label / value) sharing an ordinal row scale.
+    _cbase = alt.Chart(_card_df).transform_filter(_PICK)
+    _crow = alt.Y("ord:O", axis=None, sort="ascending")
+    _card = alt.layer(
+        _cbase.mark_text(align="right", dx=-8, fontSize=11, color="#8b959e").encode(
+            y=_crow, x=alt.value(160), text="field:N"
+        ),
+        _cbase.mark_text(align="left", dx=8, fontSize=11).encode(
+            y=_crow, x=alt.value(160), text="value:N"
+        ),
+    ).properties(width=470, height=250, title="Selected event")
 
-            - window: **{_row["start_time"]:%Y-%m-%d %H:%M} → {_row["end_time"]:%Y-%m-%d %H:%M}**
-            ({_row["dur_min"] / 60:.1f} h)
-            - classification code `{_code}`: {_code_txt}
-            - peak \(DO_2\): **{_fmt(_row["peak_do"])} mg/L**
-            - salinity step: **{_fmt(_row["sal_step"], "{:+.2f}")}**
-            - water level step: **{_fmt(_row["wl_step"], "{:+.2f}")}**
-            - antecedent precipitation (24 hours): **{_fmt(_row["precip_24h"], "{:.1f}")}**
-            - flooding: **{events.filter(pl.col("event_id") == _eid)["flooding"][0]}**
-            - number of DO excursions: **{_splice.height} event(s)**
-            """
-        )
-
-        # --- Dr. Ghosh's multi-axis event format (deck slides 10-14): one panel, four
-        # colour-matched y-axes stacked via Axis(offset=...) on layers with independent
-        # y-scales. DO (black, left), precipitation (pink bars, far left), water depth
-        # below ground (blue, right, axis REVERSED so a rising water table / flood reads
-        # as up), salinity (green, far right).
-        _C_DO, _C_PR, _C_WL, _C_SAL = "#111111", "#e377c2", "#1f77b4", "#2ca02c"
-
-        def _yaxis(_t, _color, _orient, _offset):
-            return alt.Axis(
-                title=_t,
-                orient=_orient,
-                offset=_offset,
-                titleColor=_color,
-                labelColor=_color,
-                tickColor=_color,
-                domainColor=_color,
-            )
-
-        _bx = alt.Chart(_s).encode(x=alt.X("Datetime:T", title="local time"))
-        _l_pr = _bx.mark_bar(color=_C_PR, size=1.5, opacity=0.6).encode(
-            y=alt.Y(
-                "precip:Q",
-                scale=alt.Scale(zero=True),
-                axis=_yaxis("Precip (mm/5min)", _C_PR, "left", 46),
-            )
-        )
-        _l_wl = _bx.mark_line(color=_C_WL, strokeWidth=1.6).encode(
-            y=alt.Y(
-                "wl:Q",
-                scale=alt.Scale(zero=False, reverse=True),
-                axis=_yaxis("Water depth below ground surface (cm)", _C_WL, "right", 0),
-            )
-        )
-        _l_sal = _bx.mark_line(color=_C_SAL, strokeWidth=1.6).encode(
-            y=alt.Y(
-                "sal:Q",
-                scale=alt.Scale(zero=False),
-                axis=_yaxis("Salinity (PPT)", _C_SAL, "right", 54),
-            )
-        )
-        _l_do = _bx.mark_line(color=_C_DO, strokeWidth=2).encode(
-            y=alt.Y(
-                "do:Q",
-                scale=alt.Scale(zero=True),
-                axis=_yaxis("DO (mg/L)", _C_DO, "left", 0),
-            )
-        )
-        # SHADING (drawn BEHIND the traces) — toggled by `shade_mode`:
-        #   "auto-detected events" → our detector's segments (one rect per segment);
-        #   "expert moments"       → the expert moment windows, coloured hot vs oxic.
-        _use_moments = shade_mode.value == "moments"
-        _r_auto = (
-            alt.Chart(_splice)
-            .mark_rect(opacity=0.14)
-            .encode(
-                x="cstart:T",
-                x2="cend:T",
-                color=alt.Color(
-                    "seg_no:N", legend=None, scale=alt.Scale(scheme="category10")
-                ),
-                tooltip=[
-                    alt.Tooltip("seg_no:N", title="our event #"),
-                    alt.Tooltip("cstart:T", title="start"),
-                    alt.Tooltip("cend:T", title="end"),
-                ],
-            )
-        )
-        # expert moments for this umbrella (empty for orphans), clipped to the plotted
-        # window; one rect per moment, coloured by type.
-        _mrects = (
-            expert_moments.filter(pl.col("event_id") == _eid)
-            .select(
-                pl.col("moment_idx").alias("m_no"),
-                pl.col("type").alias("m_type"),
-                pl.col("start_time").alias("m_start"),
-                pl.col("end_time").alias("m_end"),
-            )
-            .drop_nulls(["m_start", "m_end"])
-            .with_columns(
-                pl.max_horizontal("m_start", pl.lit(_start_t)).alias("m_start"),
-                pl.min_horizontal("m_end", pl.lit(_end_t)).alias("m_end"),
-            )
-        )
-        _r_moments = (
-            alt.Chart(_mrects)
-            .mark_rect(opacity=0.16)
-            .encode(
-                x="m_start:T",
-                x2="m_end:T",
-                color=alt.Color(
-                    "m_type:N",
-                    title="moment",
-                    scale=alt.Scale(
-                        domain=["hot", "oxic"], range=["#d62728", "#1f77b4"]
-                    ),
-                    legend=alt.Legend(orient="top"),
-                ),
-                tooltip=[
-                    alt.Tooltip("m_no:N", title="moment #"),
-                    alt.Tooltip("m_type:N", title="type"),
-                    alt.Tooltip("m_start:T", title="start"),
-                    alt.Tooltip("m_end:T", title="end"),
-                ],
-            )
-        )
-        _r_shade = _r_moments if _use_moments else _r_auto
-        _r_pk = (
-            alt.Chart(_peaks)
-            .mark_rule(color="#d62728", strokeDash=[3, 3], opacity=0.55)
-            .encode(x="Datetime:T")
-        )
-        _chart = (
-            alt.layer(_r_shade, _l_pr, _l_wl, _l_sal, _l_do, _r_pk)
-            .resolve_scale(y="independent")
-            .properties(
-                width=720,
-                height=440,
-                title=alt.TitleParams(_title, subtitle=f"shading: {shade_mode.value}"),
-            )
-        )
-        _out = mo.vstack(
-            [
-                _event_detection_snip,
-                mo.hstack(
-                    [
-                        mo.vstack([event_picker, shade_mode, _details]),
-                        _chart,
-                    ],
-                    justify="start",
-                ),
-            ]
-        )
-    _out
+    _view = (
+        alt.hconcat(_card, _chart)
+        .resolve_scale(x="independent", y="independent", color="independent")
+        .add_params(_eidSel, _shadeSel)
+    )
+    mo.vstack([_event_detection_snip, _view])
     return
 
 

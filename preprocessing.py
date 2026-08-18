@@ -1,7 +1,12 @@
 from pathlib import Path
 import polars as pl
 
-from core.io import read_one_year, read_expert_event_list, reformat_expert_workbook
+from core.io import (
+    read_one_year,
+    read_expert_event_list,
+    reformat_expert_workbook,
+    check_moment_counts,
+)
 from core.features import splice_readouts, event_samples
 
 
@@ -107,7 +112,7 @@ def main():
     EVENTS_XLSX = (
         Path("datasets")
         / "BeaverCreek_DO_Events_Labeled"
-        / "2019-2026 list of hot & oxic moments rev. 04-29-26.xlsx"
+        / "2019-2026 list of hot & oxic moments rev. 07-31-26.xlsx"
     )
     PUBLIC_DATA = (
         DATA_DIR
@@ -121,6 +126,13 @@ def main():
     reformatted = EVENTS_XLSX.with_name("expert_annotations_reformatted.csv")
     reformat_expert_workbook(EVENTS_XLSX, reformatted)
     expert_event_labels, expert_moment_labels = read_expert_event_list(reformatted)
+    # Reconcile the parsed moments against the expert's own per-water-year tally in the
+    # workbook's summary sheet — a hard check that the block-placement typing reproduces
+    # their counts. Printed, not asserted: one known residual (WY2021 mixed) is a typo in
+    # their sheet, whose own row totals 20 while its classes sum to 19.
+    print(
+        check_moment_counts(expert_event_labels, expert_moment_labels, EVENTS_XLSX)
+    )
     expert_event_labels.write_parquet(OUTPUT_DIR / "expert_event_list.parquet")
     expert_moment_labels.write_parquet(OUTPUT_DIR / "expert_moment_list.parquet")
 

@@ -3,7 +3,7 @@ import polars as pl
 import altair as alt
 import marimo as mo
 
-from core.features import DO_COL, WL_COL, SAL_COL, TEMP_COL, PRECIP_COL
+from core.features import DO_COL, WL_COL, SAL_COL, TEMP_COL, PRECIP_COL, FEATURE_COLS
 
 EVENTS_XLSX = "2019-2026 list of hot & oxic moments rev. 04-29-26.xlsx"
 
@@ -35,6 +35,29 @@ HYDRO_FEATURES = list(FORECAST_HYDRO.values())
 CALENDAR_FEATURES = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
 
 WS_HOT, WS_PULSE, WS_ABSTAIN = 1, -1, 0
+
+
+# ---------------------------------------------------------------------------
+# Discovery routes — the two engineered-feature tables discovery.py runs on.
+# `moments` first: it is the default route and the one the deck presents.
+#   moments -> per-moment table, each moment typed hot / oxic(pulse) individually
+#   events  -> augmented per-event table (expert_label hot / pulse / mixed)
+# Identical schemas; the moment route's hysteresis pair is degenerate (single pulse).
+# Both are DO-derived => NDA. Shared by discovery.py so the route-dependent cells can
+# load *both* routes and switch between them client-side in a static HTML export.
+# ---------------------------------------------------------------------------
+DISCOVERY_ROUTES = {
+    "moments": ("derived/processed_moments_features.parquet", "label"),
+    "events": ("derived/processed_expert_features.parquet", "expert_label"),
+}
+
+
+def read_discovery_route(route):
+    """Load one discovery route and attach the canonical display class (pulse -> oxic)."""
+    _path, _label = DISCOVERY_ROUTES[route]
+    return pl.read_parquet(_path).with_columns(
+        pl.col(_label).replace({"pulse": "oxic"}).alias("class")
+    )
 
 
 def _ws_band(_df, col, lo_p, hi_p, lo_vote, hi_vote, use_abs=False):
@@ -289,36 +312,102 @@ def build_forecast_frame(readouts, freq="1h", target=DO_COL):
     return out
 
 
-def feature_methodology_tabs(proc, proc_curves):
-    """Six-tab handcrafted-feature exposition (distribution, driver panels, example
-    curves / hysteresis loops, driver-association bullets) for eda.py. Reads the
+def feature_methodology_tabs(
+    proc, proc_curves, feature_cols=FEATURE_COLS, example_panel="curves"
+):
+    """Per-feature tabbed handcrafted-feature exposition (one tab per engineered feature:
+    distribution + defining formula + a secondary panel) for eda.py. Reads the
     per-unit features (`proc` = proc_features) and resampled curves (`proc_curves`)
     that preprocessing.py already computed on OUR detector's events — no recompute
-    of the features themselves; only plot-shaping lives here."""
+    of the features themselves; only plot-shaping lives here.
+
+    `feature_cols` selects WHICH features to expose. It defaults to the full unit-route
+    `FEATURE_COLS`. Note `splice_readouts` computes and stores the *full* FEATURE_COLS for
+    EVERY route — including hyst_wl/hyst_sal on the moment features — so we can't infer the
+    route's modelled feature set from the columns present. Pass `MOMENT_FEATURE_COLS` on the
+    moment route to hide the hysteresis pair the moment CLASSIFIER drops (degenerate on a
+    single tight rise-fall pulse), keeping the methodology slide consistent with the model.
+
+    `example_panel` picks the second chart beside each feature's histogram:
+      - "curves"        → example low/high DO curves from `proc_curves` (the eda default).
+      - "label_scatter" → a jittered strip/scatter of the feature value stratified by moment
+                          class (hot vs oxic), for the moment route (needs a label column)."""
+    if example_panel not in ("curves", "label_scatter"):
+        raise ValueError(f"example_panel must be 'curves'|'label_scatter', got {example_panel!r}")
+    # moment class label for the scatter panel (both `label` and `expert_label` carry hot/pulse)
+    _label_col = next((_c for _c in ("label", "expert_label") if _c in proc.columns), None)
+    if example_panel == "label_scatter" and _label_col is None:
+        raise ValueError("example_panel='label_scatter' needs a 'label'/'expert_label' column")
     # Handcrafted event-shape features, defined on OUR detector's events (proc_features /
     # proc_curves from preprocessing.py) — NOT the expert umbrellas, over which symmetry /
     # hysteresis are ill-defined (one umbrella can span several sub-moments). Each tab shows
     # the feature's distribution (with its defining formula), how it relates to each
     # coincident / antecedent driver, and example DO curves at the low vs high extremes.
     # peak_frac = 0 -> abrupt rise / slow decay ("hot moment"); ~0.5 -> symmetric ("oxic pulse").
+    # All engineered features (core.features.FEATURE_COLS), in canonical order: event
+    # magnitude / duration, curve shape, coincident driver levels + antecedent steps, the
+    # curve-morphology scalars, the DO–driver hysteresis pair, then the antecedent-precip
+    # lag ladder. `_feat_meta` = short tab label, `_feat_formula` = the defining formula.
     _feat_meta = {
-        "peak_frac": "Time-To-Peak",
+        "dur_min": "Duration",
+        "n_samples": "Sample count",
+        "peak_do": r"\(\max(DO_2)\)",
+        "mean_do": r"\(\langle DO_2\rangle\)",
+        "area_mgLh": "DO area",
+        "peak_frac": "Rel. time to peak",
+        "rise_min": "Rise time",
+        "fall_min": "Fall time",
         "rise_rate": r"\(\text{Rate}_{DO_{2}}\)",
-        "sal_step": r"\(\Delta \text{Salinity}\)",
-        "temp_step": r"\(\Delta T\)",
+        "fall_rate": r"\(\text{Rate}^{\rm fall}_{DO_{2}}\)",
+        "sal_in": r"\(\langle\text{Salinity}\rangle\)",
+        "wl_in": r"\(\langle\text{Water-level}\rangle\)",
+        "temp_in": r"\(\langle T\rangle\)",
+        "sal_step": r"\(\Delta \langle\text{Salinity}\rangle\)",
+        "wl_step": r"\(\Delta \langle\text{Water-level}\rangle\)",
+        "temp_step": r"\(\Delta \langle T\rangle\)",
+        "centroid_frac": "DO centroid",
+        "max_rise_norm": "Max step",
+        "plateau_frac": "Plateau fraction",
+        "hyst_wl": "W.L. hysteresis",
+        "hyst_sal": "Salinity hysteresis",
+        "precip_24h": "Antecedent precip. (24h)",
+        "precip_72h": "Antecedent precip. (72h)",
+        "precip_168h": "Antecedent precip. (168h)",
     }
 
     _feat_formula = {
-        "peak_frac": r"\(\frac{\operatorname*{arg\,max}_i\, d_i}{n-1}\)",
-        "rise_rate": r"\(\frac{d(DO_2)}{dt}\)",
-        "sal_step": r"\(\langle \text{Sal.(t)} \rangle_{t \in (\rm start, end)} - \langle \text{Sal.(t)} \rangle_{t \in (\rm start - 24h, start)}\) (PSU) | (start, end) = begin and end time-stamps of the moment",
-        "temp_step": r"\(\langle T(t) \rangle_{t \in (\rm start, end)} - \langle T(t) \rangle_{t \in (\rm start - 24h, start)}\) (\(\degree C\)) | (start, end) = begin and end time-stamps of the moment",
-        "centroid_frac": r"$$\mathrm{centroid\_frac}=\frac{\sum_i i\, d_i}{(n-1)\sum_i d_i}$$",
-        "max_rise_norm": r"$$\mathrm{max\_rise\_norm}=\frac{\max_i\,(d_{i+1}-d_i)}{\max_i d_i}$$",
-        "plateau_frac": r"$$\mathrm{plateau\_frac}=\frac{1}{n}\sum_i \mathbf{1}\!\left[d_i\ge 0.8\,d_{\max}\right]$$",
-        "hyst_wl": r"$$\mathrm{hyst\_wl}=\operatorname*{mean}_{g}\bigl(\hat d_\uparrow(g)-\hat d_\downarrow(g)\bigr)$$",
-        "hyst_sal": r"$$\mathrm{hyst\_sal}=\operatorname*{mean}_{g}\bigl(\hat d_\uparrow(g)-\hat d_\downarrow(g)\bigr)$$",
+        "dur_min": r"\(t_{\rm end} - t_{\rm start}\) (min)",
+        "n_samples": r"\(N_{\rm steps}\) = number of 5-min readouts in \((\rm start, end)\)",
+        "peak_do": r"\(\max_i (DO_2)_i\) (mg/L)",
+        "mean_do": r"\(\frac{1}{N_{\rm steps}}\sum_{i=1}^{N_{\rm steps}} (DO_2)_i\) (mg/L)",
+        "area_mgLh": r"\(\sum_{i=1}^{N_{\rm steps}} (DO_2)_i\,\Delta t,\; \Delta t = 5\,\text{min}\) (mg/L·h)",
+        "peak_frac": r"\(\frac{t_{\rm peak} - t_{\rm start}}{t_{\rm end} - t_{\rm start}}\)",
+        "rise_min": r"\(t_{\rm peak} - t_{\rm start}\) (min)",
+        "fall_min": r"\(t_{\rm end} - t_{\rm peak}\) (min)",
+        "rise_rate": r"\(\frac{\partial(DO_2)}{\partial t}\)",
+        "fall_rate": r"\(\frac{\max(DO_2)}{t_{\rm end} - t_{\rm peak}}\) (mg/L·h)",
+        "sal_in": r"\(\frac{1}{N_{\rm steps}}\sum_{i=1}^{N_{\rm steps}}\text{Sal.}_i\)",
+        "wl_in": r"\(\frac{1}{N_{\rm steps}}\sum_{i=1}^{N_{\rm steps}}\text{W.L.}_i\)",
+        "temp_in": r"\(\frac{1}{N_{\rm steps}}\sum_{i=1}^{N_{\rm steps}} T_i\)",
+        "sal_step": r"\(\langle \text{Sal.(t)} \rangle_{t \in (\rm start, end)} - \langle \text{Sal.(t)} \rangle_{t \in (\rm start - 24h, start)}\) (PSU)",
+        "wl_step": r"\(\langle \text{WL(t)} \rangle_{t \in (\rm start, end)} - \langle \text{WL(t)} \rangle_{t \in (\rm start - 24h, start)}\) (BGS, cm)",
+        "temp_step": r"\(\langle T(t) \rangle_{t \in (\rm start, end)} - \langle T(t) \rangle_{t \in (\rm start - 24h, start)}\) (\(\degree C\))",
+        "centroid_frac": r"\(\frac{\sum_i i\,(DO_2)_i}{(N_{\rm steps}-1)\sum_i (DO_2)_i}\) — DO-weighted time centroid, normalised to \([0,1]\)",
+        "max_rise_norm": r"\(\frac{\max_i[(DO_2)_{i+1} - (DO_2)_i]}{\max(DO_2)}\) — largest single 5-min jump, peak-normalised",
+        "plateau_frac": r"\(\frac{1}{N_{\rm steps}}\sum_i \mathbb{1}\!\left[(DO_2)_i \geq 0.8\,\max(DO_2)\right]\)",
+        "hyst_wl": r"\(\left\langle DO_2^{\rm rise}(\text{W.L.}) - DO_2^{\rm fall}(\text{W.L.})\right\rangle\) — mean gap between rising & falling limbs of the peak-normalised \(DO_2\)–W.L. loop",
+        "hyst_sal": r"\(\left\langle DO_2^{\rm rise}(\text{Sal.}) - DO_2^{\rm fall}(\text{Sal.})\right\rangle\) — mean gap between rising & falling limbs of the peak-normalised \(DO_2\)–Sal. loop",
+        "precip_24h": r"\(\sum_{t \in (\rm start - 24h, start)}\text{Precip}(t)\) (mm)",
+        "precip_72h": r"\(\sum_{t \in (\rm start - 72h, start)}\text{Precip}(t)\) (mm)",
+        "precip_168h": r"\(\sum_{t \in (\rm start - 168h, start)}\text{Precip}(t)\) (mm)",
     }
+
+    # Expose only the features the CALLER asked for (`feature_cols`) that are also physically
+    # present in the frame. `splice_readouts` stores the full FEATURE_COLS for every route, so
+    # the moment features parquet DOES carry computed hyst_wl/hyst_sal — pass MOMENT_FEATURE_COLS
+    # to drop them here, matching the moment classifier (which excludes the degenerate loop).
+    _keep = [_c for _c in feature_cols if _c in proc.columns]
+    _feat_meta = {_k: _v for _k, _v in _feat_meta.items() if _k in _keep}
 
     def _example_chart(ycol):
         # 2 lowest + 2 highest units on THIS tab's feature; DO curve over normalised time
@@ -358,6 +447,37 @@ def feature_methodology_tabs(proc, proc_curves):
             )
         )
 
+    def _label_scatter(ycol):
+        # Feature value stratified by moment class (hot vs oxic): a jittered strip/scatter so
+        # the hot-vs-oxic separation each feature carries reads directly off the y-axis. Class
+        # from `_label_col` with pulse -> oxic (matching eda's label survey); nulls dropped.
+        _d = proc.select(
+            pl.col(ycol).cast(pl.Float64),
+            pl.col(_label_col).replace({"pulse": "oxic"}).alias("class"),
+        ).drop_nulls()
+        return (
+            alt.Chart(_d)
+            .mark_circle(size=55, opacity=0.55)
+            .encode(
+                alt.X("class:N", title="moment label", sort=["hot", "oxic", "mixed"]),
+                alt.Y(f"{ycol}:Q", title=ycol),
+                alt.XOffset("jitter:Q"),  # spread points within each class band
+                alt.Color(
+                    "class:N",
+                    title="class",
+                    sort=["hot", "oxic", "mixed"],
+                    scale=alt.Scale(
+                        domain=["hot", "oxic", "mixed"],
+                        range=["#c1440e", "#3b7dd8", "#9467bd"],
+                    ),
+                ),
+                tooltip=["class:N", alt.Tooltip(f"{ycol}:Q", format=".3f")],
+            )
+            # Box–Muller gaussian jitter (Vega-Lite strip-plot idiom) on the offset channel
+            .transform_calculate(jitter="sqrt(-2*log(random()))*cos(2*PI*random())")
+            .properties(width=400, height=190, title=f"{ycol} by moment label")
+        )
+
     def _feat_tab(ycol):
         _title = _feat_meta[ycol]
         _hist = (
@@ -373,6 +493,7 @@ def feature_methodology_tabs(proc, proc_curves):
                 title=f"{ycol}  (n = {proc.height} of our events)",
             )
         )
+        _panel = _example_chart(ycol) if example_panel == "curves" else _label_scatter(ycol)
         return mo.vstack(
             [
                 mo.md(f"""
@@ -381,11 +502,57 @@ def feature_methodology_tabs(proc, proc_curves):
                 mo.hstack(
                     [
                         _hist,
-                        _example_chart(ycol),
+                        _panel,
                     ],
                     justify="start",
                 ),
             ],
         )
 
-    return mo.ui.tabs({_meta: _feat_tab(_key) for _key, _meta in _feat_meta.items()})
+    # Group the 24 features into physically-meaningful categories → two-level tabs
+    # (outer = category, inner = the features in it) so the label row stays short.
+    # Order within each group follows FEATURE_COLS.
+    _groups = {
+        "Magnitude & duration": [
+            "dur_min",
+            "n_samples",
+            "peak_do",
+            "mean_do",
+            "area_mgLh",
+        ],
+        # "Rise / fall shape": ["peak_frac", "rise_min", "fall_min", "rise_rate", "fall_rate"],
+        "Drivers (levels & steps)": [
+            "sal_in",
+            "wl_in",
+            "temp_in",
+            "sal_step",
+            "wl_step",
+            "temp_step",
+        ],
+        "Curve morphology": [
+            "peak_frac",
+            "rise_min",
+            "fall_min",
+            "rise_rate",
+            "fall_rate",
+            "centroid_frac",
+            "max_rise_norm",
+            "plateau_frac",
+        ],
+        "Hysteresis": ["hyst_wl", "hyst_sal"],
+        "Antecedent precip.": ["precip_24h", "precip_72h", "precip_168h"],
+    }
+
+    # Build each category's inner tabs from only its present features, and drop any group the
+    # column guard emptied (e.g. Hysteresis on the moment route). A stray feature not assigned
+    # to any group would silently disappear, so assert full coverage of the present features.
+    _grouped_keys = {_k for _keys in _groups.values() for _k in _keys}
+    assert set(_feat_meta) <= _grouped_keys, (
+        f"ungrouped features: {set(_feat_meta) - _grouped_keys}"
+    )
+    _outer = {}
+    for _label, _keys in _groups.items():
+        _kept = [_k for _k in _keys if _k in _feat_meta]
+        if _kept:
+            _outer[_label] = mo.ui.tabs({_feat_meta[_k]: _feat_tab(_k) for _k in _kept})
+    return mo.ui.tabs(_outer)
