@@ -1,0 +1,38 @@
+name: Deploy slides to GitHub Pages
+
+# Manual-only on purpose: this publishes to a PUBLIC URL. It must never fire
+# from a plain `git push`. Review the contents of `site/` before every run.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The deck cannot be built in CI: it needs the local NDA parquets and a
+      # GPU. `site/` therefore holds a pre-built export, committed by hand.
+      - name: Verify payload exists
+        run: |
+          test -f site/index.html || { echo "site/index.html missing"; exit 1; }
+          du -h site/index.html
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
