@@ -17,5 +17,6 @@ c4555afe13d5069c786bba4f4b67d06870013d15  core/src/core/nn/__init__.py
 e12af379a55a7c6bae240f63d866fc3bdbf9b086  core/src/core/io.py
 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391  core/README.md
 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391  core/src/core/py.typed
+ea1ede03bb4ce40820cfb0f2bd7355363c4cb101  scripts/export-slides.sh
 ebd8f25608a23e93ff3fcff4b74a3b9748fd0fff  core/src/core/features.py
 fb9e94ffbae053fc2ae2242df638ab01911df98d  assets/beaver_creek_site.jpg

@@ -11,7 +11,7 @@ set -uo pipefail
 
 EXPORT_TIMEOUT=300   # measured ~20s; 15x headroom, matches AGENTS.md
 
-SOURCES=(slides.py eda.py utils.py core layouts/slides.slides.json assets)
+SOURCES=(slides.py eda.py utils.py core layouts/slides.slides.json assets scripts/export-slides.sh)
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
@@ -38,7 +38,7 @@ log="$(mktemp)"
 trap 'rm -f "$tmp" "$log"' EXIT
 
 say "exporting slides.py (~20s)..."
-timeout "$EXPORT_TIMEOUT" .venv/bin/marimo export html slides.py -o "$tmp" >"$log" 2>&1
+timeout "$EXPORT_TIMEOUT" .venv/bin/marimo export html slides.py --no-include-code -o "$tmp" >"$log" 2>&1
 rc=$?
 
 [ "$rc" -eq 124 ] && { tail -20 "$log" | sed 's/^/  | /' >&2; fail "timed out after ${EXPORT_TIMEOUT}s"; }

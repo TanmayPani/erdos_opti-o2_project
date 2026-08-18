@@ -161,6 +161,12 @@ parse. The CSV is NDA-derived → gitignored under `datasets/`, regenerated on e
   The `export-slides` hook runs `scripts/export-slides.sh`, which exports `slides.py` →
   `site/index.html` and stages it. Its `files:` regex limits it to commits that stage
   `slides.py` / `eda.py` / `utils.py` / `core/` / `layouts/slides.slides.json` / `assets/`.
+- The published page is a **findings page, not a slide deck** — `slides.py` carries no
+  `layout_file`. The publish export therefore uses **`--no-include-code`**; marimo's default
+  is `--include-code`, which is right for the *validation* command in "Marimo workflow"
+  below but wrong for a reader-facing page. Don't copy one command for the other job.
+- `scripts/export-slides.sh` is itself in `SOURCES`, so editing the build recipe invalidates
+  the manifest and forces a rebuild on the next commit.
 - A full CLI export is **~20 s** (measured; `EXPORT_TIMEOUT=300` is the failure ceiling,
   not an expectation) — the fresh kernel hits `persistent_cache` on disk.
 - **`site/.build-manifest`** holds the *index* blob hashes of those 21 sources. The script

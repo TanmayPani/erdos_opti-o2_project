@@ -11,4 +11,4 @@ repos:
         verbose: true
         stages: [pre-commit]
         # Only when something the deck is built from is staged.
-        files: ^(slides\.py|eda\.py|utils\.py|core/|layouts/slides\.slides\.json|assets/)
+        files: ^(slides\.py|eda\.py|utils\.py|core/|layouts/slides\.slides\.json|assets/|scripts/export-slides\.sh)
