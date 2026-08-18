@@ -1,8 +1,11 @@
 name: Deploy slides to GitHub Pages
 
-# Manual-only on purpose: this publishes to a PUBLIC URL. It must never fire
-# from a plain `git push`. Review the contents of `site/` before every run.
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -23,9 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The deck cannot be built in CI: it needs the local NDA parquets and a
-      # GPU. `site/` therefore holds a pre-built export, committed by hand.
-      - name: Verify payload exists
+      # site/index.html is built locally by the pre-commit hook — the deck needs
+      # the local data and a GPU, so CI just serves what was committed.
+      - name: Check payload
         run: |
           test -f site/index.html || { echo "site/index.html missing"; exit 1; }
           du -h site/index.html

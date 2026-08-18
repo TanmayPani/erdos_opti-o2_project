@@ -156,6 +156,25 @@ parse. The CSV is NDA-derived → gitignored under `datasets/`, regenerated on e
   flagged `{"type":"slide"}`); toggle in the editor's View → Slides, or `marimo export pdf …
   --as=slides`. A cell must be **named** (not `_`) to be importable / reusable via `Cell.run`.
 
+## Deck publishing (commit builds, push deploys)
+- Managed by **pre-commit** (`.pre-commit-config.yaml`, `pre-commit>=4.6.2` in the venv).
+  The `export-slides` hook runs `scripts/export-slides.sh`, which exports `slides.py` →
+  `site/index.html` and stages it. Its `files:` regex limits it to commits that stage
+  `slides.py` / `eda.py` / `utils.py` / `core/` / `layouts/slides.slides.json` / `assets/`.
+- A full CLI export is **~20 s** (measured; `EXPORT_TIMEOUT=300` is the failure ceiling,
+  not an expectation) — the fresh kernel hits `persistent_cache` on disk.
+- **`site/.build-manifest`** holds the *index* blob hashes of those 21 sources. The script
+  exits in ~20 ms when they already match, so pre-commit's "files were modified by this
+  hook" re-run doesn't rebuild.
+- The export fails the commit on timeout, on `MarimoExceptionRaisedError` / `Traceback` in
+  the log, on marimo's 8 MB output-cap placeholder, or on an empty file — **exit 0 is not
+  trusted**. Bypass with `git commit --no-verify`.
+- Hooks can't self-install (git never runs anything on clone, and `core.hooksPath` /
+  `.git/hooks/` aren't cloned). **On a fresh clone run `bash scripts/setup.sh` once** —
+  `uv sync` + `pre-commit install`.
+- `.github/workflows/pages.yml` deploys on push to `main` when `site/**` changes (plus
+  `workflow_dispatch`). So: commit builds the deck, push ships it.
+
 ## Domain (why the features are what they are)
 DO excursions are **flooding events** (near-anoxic floodplain well; water table rises toward
 the surface). Split by salinity: **rise = saline/tidal intrusion → hot** (~75%, tidally

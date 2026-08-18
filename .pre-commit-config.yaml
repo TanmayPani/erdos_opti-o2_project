@@ -1,0 +1,14 @@
+# Run `bash scripts/setup.sh` once per clone to install these.
+repos:
+  - repo: local
+    hooks:
+      - id: export-slides
+        name: export slides deck
+        entry: scripts/export-slides.sh
+        language: system
+        pass_filenames: false
+        require_serial: true
+        verbose: true
+        stages: [pre-commit]
+        # Only when something the deck is built from is staged.
+        files: ^(slides\.py|eda\.py|utils\.py|core/|layouts/slides\.slides\.json|assets/)
