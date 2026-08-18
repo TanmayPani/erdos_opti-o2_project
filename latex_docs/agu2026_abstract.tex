@@ -1,0 +1,46 @@
+% AGU 2026 abstract — Opti O2 / Beaver Creek WA dissolved-oxygen classification
+% Derived from the contents and conclusions of slides.py (the presentation deck).
+%
+% AGU limits: Title <= 300 characters, Abstract text <= 2000 characters.
+% Plain-text counts of the content below: Title = 197 chars, Abstract = 1908 chars.
+% (The counts refer to the rendered prose, not the LaTeX source markup.)
+%
+% Compile: pdflatex agu2026_abstract.tex
+
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage[margin=1in]{geometry}
+\usepackage{parskip}
+\usepackage{lineno}
+
+\title{Tidal Hiccups and Oxic Sighs: Machine-Learning classification of
+oxygenation events in a transitioning coastal wetland}
+
+\author{Tanmay Pani}
+\date{AGU Annual Meeting 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+%	\linenumbers
+Coastal wetlands are converting former freshwater floodplains into tidally
+influenced marsh, reshaping the subsurface dissolved-oxygen (DO) regime that
+governs biogeochemical function. At Beaver Creek, Washington, a near-anoxic
+floodplain well (DO levels below detection $\sim$92\% of the time), punctuated by
+episodic oxygenation events. These events fall into two physically distinct
+classes: abrupt, asymmetric ``hot moments'' driven by tidal/saline intrusion, and
+slower, symmetric ``oxic pulses'' driven by freshwater rise from precipitation/flooding. 
+We formalize separating these regimes as a supervised
+classification problem using six years of co-located 5-minute DO, hydrology
+(water level, salinity, temperature), and weather measurements.
+
+We compare two modeling tracks. The first uses tabular classification models on domain-engineered event-shape features encoding morphology of the DO vs time data, change in salinity and water-level,
+antecedent-precipitation, etc. The second directly uses raw multivariate time-series data either as inputs to a Convolutional Neural Network (CNN), or through automatic encoding into \(\mathcal{O}(10^4)\) features capturing correlations over various time scales, fed into tabular models. Classification performance is reported through metrics like Confusion Matrix, F1-score, Balanced Accuracy, etc.
+
+Furthermore, through feature importance attribution, we have are isolating and identifying the various drivers for these DO events.
+\end{abstract}
+
+\end{document}
