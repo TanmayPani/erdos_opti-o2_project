@@ -1,0 +1,131 @@
+/* ---------------------------------------------------------------------------
+   Opti O2 findings page — "glass" theme.
+
+   Wired in by `marimo.App(css_file="assets/theme.css")` in slides.py; marimo
+   inlines this file into the <head> of the static HTML export, so it needs no
+   companion request at view time.
+
+   The background photo is NOT here. A standalone export cannot reference
+   assets/ on disk, so slides.py's `page_theme` cell sets `--o2-photo` to a
+   base64 data-URI at run time — the same trick the title cell already uses for
+   the logos. Until it does, `--o2-photo: none` is a valid background layer and
+   the page simply falls back to the flat scrim colour.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --o2-photo: none;                        /* overwritten by the page_theme cell */
+  --o2-void: #080f16;                      /* under everything, incl. overscroll */
+  --o2-scrim-top: rgba(8, 15, 22, 0.72);
+  --o2-scrim-bottom: rgba(8, 15, 22, 0.92);
+  --o2-glass: rgba(12, 21, 30, 0.55);
+  --o2-glass-edge: rgba(255, 255, 255, 0.09);
+}
+
+/* The photo sits on a fixed layer behind the whole document, so it stays put
+   while the page scrolls instead of tiling or stretching with the content.
+   `background-attachment: fixed` would do the same but is ignored on iOS. */
+html {
+  background: var(--o2-void);
+}
+
+body {
+  background: transparent !important;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(var(--o2-scrim-top), var(--o2-scrim-bottom)),
+    var(--o2-photo);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/* The app shell carries tailwind's `bg-background` — an opaque #181c1a panel
+   stretched over the viewport, which would otherwise hide the photo layer
+   entirely. Scoped to #App so component popovers keep their own surface. */
+#root,
+#root > div,
+#App {
+  background: transparent !important;
+}
+
+/* --- Clear cells ---------------------------------------------------------
+   marimo already drops the cell background in a kernel-less export
+   (`#App.disconnected .marimo-cell`), but not the border, and not in the
+   editor. Do it unconditionally so the notebook looks the same in both. */
+#App .marimo-cell,
+#App .marimo-cell > *,
+#App .output-area,
+#App .console-output-area {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+#App .marimo-cell {
+  border-color: transparent !important;
+}
+
+/* --- Content ---------------------------------------------------------------
+   Everything below is deliberately NOT scoped under `#App`: marimo renders cell
+   output inside <marimo-mime-renderer> / <marimo-tabs> shadow roots, and it
+   adopts this stylesheet into them — but an `#App ` ancestor can never match
+   from inside a shadow tree, so a scoped selector would silently do nothing.
+
+   --- Prose ---------------------------------------------------------------
+   A photo is a busy backdrop for body text; the shadow buys contrast without
+   putting a panel behind every paragraph. Scoped to markdown so it never
+   reaches SVG chart labels, where it reads as a smear. */
+.markdown {
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.75);
+}
+
+/* --- Charts and images ---------------------------------------------------
+   Charts render on a transparent canvas (see the Altair theme in slides.py's
+   setup cell), which leaves their gridlines fighting the photo. A faint glass
+   panel re-establishes the plot as its own surface while still letting the
+   background read through it. */
+/* Panels whose charts were rendered to HTML *before* `@mo.persistent_cache` stored them
+   (modeling.py's SHAP `mo.hstack`) carry a spec serialized under whatever theme was live at
+   cache time, so vega-embed's dark theme paints an opaque #333 canvas on them — an inline
+   style the Altair theme can no longer reach. `!important` outranks it, and this keeps the
+   glass working for any cached-HTML panel, present or future. */
+.vega-embed svg.marks {
+  background-color: transparent !important;
+}
+
+.vega-embed {
+  background: var(--o2-glass);
+  border: 1px solid var(--o2-glass-edge);
+  border-radius: 12px;
+  padding: 0.6rem 0.75rem;
+  backdrop-filter: blur(7px);
+  -webkit-backdrop-filter: blur(7px);
+}
+
+/* Raster figures carry their own (light) background, so give them an edge
+   rather than trying to blend them in. */
+.markdown img,
+img.mo-image {
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* Tables get the glass; TAB PANELS deliberately do NOT. Translucent layers compound —
+   the SHAP cell nests route tabs inside model tabs, so a panel background there stacked
+   three deep with the chart's own and turned into a near-solid slab. One glass layer per
+   chart, always the innermost one. */
+.marimo-cell table {
+  background: var(--o2-glass);
+  border-radius: 10px;
+}

@@ -9,6 +9,7 @@
 6411b9815cc06f85ec8fa6b38b831ae3c10e5668  core/src/core/io.py
 6e639ce5f6167094a5e36496366d3a4652b987f1  core/src/core/nn/_transform.py
 7b84739feeddce026f7cf39e64eeb4ea7e8b61db  scripts/export-slides.sh
+8d16cbd69433da8d6e9da23b1a0e93b3da790982  assets/theme.css
 91e17292517ec4d32288ee57fc35a702610b1e78  core/src/core/nn/_loss.py
 a35c3ffa3213765d23031ff00b5979864af01380  core/src/core/estimator.py
 aac75d66e6f5015444b5aaa796fd7c87c4aeb5f1  assets/title_slide_bg.jpg
